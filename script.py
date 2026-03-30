@@ -1,19 +1,22 @@
 #!/usr/bin/env python3
-"""Veracode SBOM Generator - Generate SBOMs from Veracode platform"""
+"""Veracode SBOM Generator - Generate SBOMs from Veracode platform."""
 
 import os
 import re
 import sys
 import json
+import time
 import logging
 import argparse
 from datetime import datetime
-from dataclasses import dataclass
-from typing import Optional, List, Dict, Tuple
+from dataclasses import dataclass, field
+from typing import Optional, List, Dict, Set
 from urllib.parse import urlparse, parse_qs
 
 try:
     import requests
+    from requests.adapters import HTTPAdapter
+    from urllib3.util.retry import Retry
     from veracode_api_signing.plugin_requests import RequestsAuthPluginVeracodeHMAC
 except ImportError:
     print("Error: Required packages not installed.")
@@ -23,36 +26,44 @@ except ImportError:
 logging.basicConfig(level=logging.INFO, format="%(message)s")
 logger = logging.getLogger(__name__)
 
+# Constants
 UNSAFE_FILENAME_CHARS = re.compile(r'[/\\:*?"<>| ]')
 REQUEST_TIMEOUT = 30
+MAX_RETRIES = 3
+RETRY_BACKOFF_FACTOR = 1.0
+RATE_LIMIT_DELAY = 0.2
+PAGE_SIZE = 10
 
 
 @dataclass
 class SBOMResult:
+    """Result of an SBOM generation attempt."""
     guid: str
     name: str
-    sbom: Optional[Dict]
+    sbom: Optional[Dict] = None
+    error: Optional[str] = None
     
     @property
     def success(self) -> bool:
-        return self.sbom is not None
+        return self.sbom is not None and bool(self.sbom)
 
 
 class VeracodeSBOMGenerator:
+    """Client for generating SBOMs from the Veracode platform."""
     
-    REGIONS = {
+    REGIONS: Dict[str, str] = {
         "commercial": "https://api.veracode.com",
         "european": "https://api.veracode.eu", 
         "federal": "https://api.veracode.us"
     }
     
-    ENDPOINTS = {
+    ENDPOINTS: Dict[str, str] = {
         "applications": "/appsec/v1/applications",
         "collections": "/appsec/v1/collections",
         "workspaces": "/srcclr/v3/workspaces",
     }
     
-    def __init__(self, region: str = "commercial"):
+    def __init__(self, region: str = "commercial") -> None:
         self.base_url = self.REGIONS.get(region.lower(), self.REGIONS["commercial"])
         self.session = requests.Session()
         self.session.auth = RequestsAuthPluginVeracodeHMAC()
@@ -61,42 +72,100 @@ class VeracodeSBOMGenerator:
             "Content-Type": "application/json"
         })
         
-    def __enter__(self):
+        retry_strategy = Retry(
+            total=MAX_RETRIES,
+            backoff_factor=RETRY_BACKOFF_FACTOR,
+            status_forcelist=[500, 502, 503, 504],
+            allowed_methods=["GET"],
+            raise_on_status=False
+        )
+        adapter = HTTPAdapter(max_retries=retry_strategy)
+        self.session.mount("https://", adapter)
+        self.session.mount("http://", adapter)
+        self._last_request_time = 0.0
+        
+    def __enter__(self) -> "VeracodeSBOMGenerator":
         return self
     
-    def __exit__(self, exc_type, exc_val, exc_tb):
-        self.session.close()
+    def __exit__(self, exc_type, exc_val, exc_tb) -> bool:
+        self.close()
         return False
+    
+    def close(self) -> None:
+        """Close the HTTP session."""
+        self.session.close()
         
     def _make_request(self, endpoint: str, params: Optional[Dict] = None) -> Dict:
+        """Make an authenticated API request with rate limiting and retries."""
+        elapsed = time.time() - self._last_request_time
+        if elapsed < RATE_LIMIT_DELAY:
+            time.sleep(RATE_LIMIT_DELAY - elapsed)
+        
         url = f"{self.base_url}{endpoint}"
-        try:
-            response = self.session.get(url, params=params, timeout=REQUEST_TIMEOUT)
-            response.raise_for_status()
-            return response.json()
-        except requests.exceptions.Timeout:
-            logger.error("Request timed out: %s", endpoint)
-            return {}
-        except requests.exceptions.HTTPError as e:
-            status = e.response.status_code if e.response is not None else "unknown"
-            messages = {
-                401: "Authentication failed. Check your API credentials.",
-                403: "Access denied.",
-                404: f"Resource not found: {endpoint}",
-            }
-            logger.error("[%s] %s", status, messages.get(status, str(e)))
-            return {}
-        except requests.exceptions.RequestException as e:
-            logger.error("Request failed: %s", e)
-            return {}
+        last_exception: Optional[Exception] = None
+        
+        for attempt in range(MAX_RETRIES + 1):
+            try:
+                response = self.session.get(url, params=params, timeout=REQUEST_TIMEOUT)
+                self._last_request_time = time.time()
+                
+                if response.status_code == 429:
+                    if attempt < MAX_RETRIES:
+                        retry_after = int(response.headers.get("Retry-After", 60))
+                        logger.warning("Rate limited. Waiting %d seconds...", retry_after)
+                        time.sleep(retry_after)
+                        continue
+                    logger.error("Rate limit exceeded after retries.")
+                    return {}
+                
+                response.raise_for_status()
+                return response.json()
+                
+            except requests.exceptions.JSONDecodeError:
+                logger.error("Invalid JSON response from: %s", endpoint)
+                return {}
+            except requests.exceptions.Timeout as e:
+                last_exception = e
+                if attempt < MAX_RETRIES:
+                    wait_time = RETRY_BACKOFF_FACTOR * (2 ** attempt)
+                    logger.warning("Timeout, retrying in %.1fs... (%d/%d)", 
+                                  wait_time, attempt + 1, MAX_RETRIES)
+                    time.sleep(wait_time)
+                    continue
+            except requests.exceptions.ConnectionError as e:
+                last_exception = e
+                if attempt < MAX_RETRIES:
+                    wait_time = RETRY_BACKOFF_FACTOR * (2 ** attempt)
+                    logger.warning("Connection error, retrying in %.1fs... (%d/%d)",
+                                  wait_time, attempt + 1, MAX_RETRIES)
+                    time.sleep(wait_time)
+                    continue
+            except requests.exceptions.HTTPError as e:
+                status = e.response.status_code if e.response is not None else "unknown"
+                messages = {
+                    401: "Authentication failed. Check your API credentials.",
+                    403: "Access denied.",
+                    404: f"Resource not found: {endpoint}",
+                }
+                logger.error("[%s] %s", status, messages.get(status, str(e)))
+                return {}
+            except requests.exceptions.RequestException as e:
+                logger.error("Request failed: %s", e)
+                return {}
+        
+        if last_exception:
+            logger.error("Request failed after %d retries: %s", MAX_RETRIES, last_exception)
+        return {}
     
     def _extract_embedded(self, result: Dict, key: str) -> List[Dict]:
+        """Extract embedded items from HAL response."""
         if not result:
             return []
         return result.get("_embedded", {}).get(key, [])
     
-    def _get_all_pages(self, endpoint: str, embedded_key: str, params: Optional[Dict] = None) -> List[Dict]:
-        """Generic pagination handler using _links.next or page object."""
+    def _get_all_pages(self, endpoint: str, embedded_key: str, 
+                       params: Optional[Dict] = None) -> List[Dict]:
+        """Fetch all pages using HAL _links.next or page object pagination."""
         all_items: List[Dict] = []
         current_params = params.copy() if params else {}
         current_endpoint = endpoint
@@ -110,16 +179,13 @@ class VeracodeSBOMGenerator:
             
             all_items.extend(items)
             
-            # Check for _links.next pagination (HAL format)
-            links = result.get("_links", {})
-            next_link = links.get("next", {}).get("href")
+            next_link = result.get("_links", {}).get("next", {}).get("href")
             if next_link:
                 parsed = urlparse(next_link)
                 current_endpoint = parsed.path
                 current_params = {k: v[0] for k, v in parse_qs(parsed.query).items()}
                 continue
             
-            # Check for page-based pagination
             page_info = result.get("page", {})
             if page_info:
                 current_page = page_info.get("number", 0)
@@ -134,6 +200,7 @@ class VeracodeSBOMGenerator:
     
     def _get_sbom(self, target_guid: str, sbom_format: str, target_type: str = "application",
                   include_linked: bool = False, include_vulnerabilities: bool = True) -> Optional[Dict]:
+        """Fetch SBOM for a target."""
         endpoint = f"/srcclr/sbom/v1/targets/{target_guid}/{sbom_format}"
         params = {
             "type": target_type,
@@ -141,15 +208,19 @@ class VeracodeSBOMGenerator:
         }
         if target_type == "application" and include_linked:
             params["linked"] = "true"
-        return self._make_request(endpoint, params) or None
+        
+        result = self._make_request(endpoint, params)
+        return result if result else None
     
     def get_applications(self, name_filter: Optional[str] = None, page_size: int = 100) -> List[Dict]:
+        """Get all applications, optionally filtered by name."""
         params = {"size": page_size}
         if name_filter:
             params["name"] = name_filter
         return self._get_all_pages(self.ENDPOINTS["applications"], "applications", params)
     
     def get_application_by_name(self, app_name: str) -> Optional[Dict]:
+        """Find an application by exact name match (case-insensitive)."""
         apps = self.get_applications(name_filter=app_name)
         app_name_lower = app_name.lower()
         return next(
@@ -160,21 +231,26 @@ class VeracodeSBOMGenerator:
     def generate_app_sbom(self, app_guid: str, sbom_format: str = "cyclonedx",
                           include_linked: bool = False, 
                           include_vulnerabilities: bool = True) -> Optional[Dict]:
+        """Generate SBOM for an application."""
         return self._get_sbom(app_guid, sbom_format, "application", include_linked, include_vulnerabilities)
     
     def get_collections(self) -> List[Dict]:
+        """Get all collections."""
         return self._get_all_pages(self.ENDPOINTS["collections"], "collections")
     
     def get_collection_by_name(self, collection_name: str) -> Optional[Dict]:
+        """Find a collection by exact name match (case-insensitive)."""
         name_lower = collection_name.lower()
         return next((c for c in self.get_collections() if c.get("name", "").lower() == name_lower), None)
     
     def get_collection_assets(self, collection_guid: str) -> List[Dict]:
+        """Get all assets in a collection."""
         return self._get_all_pages(f"{self.ENDPOINTS['collections']}/{collection_guid}/assets", "assets")
     
     def generate_collection_sboms(self, collection_guid: str, sbom_format: str = "cyclonedx",
                                    include_linked: bool = False,
                                    include_vulnerabilities: bool = True) -> List[SBOMResult]:
+        """Generate SBOMs for all applications in a collection."""
         assets = self.get_collection_assets(collection_guid)
         total = len(assets)
         logger.info("\nFound %d applications in collection", total)
@@ -189,16 +265,20 @@ class VeracodeSBOMGenerator:
         return results
     
     def get_workspaces(self) -> List[Dict]:
+        """Get all SCA workspaces."""
         return self._get_all_pages(self.ENDPOINTS["workspaces"], "workspaces")
     
     def get_workspace_by_name(self, workspace_name: str) -> Optional[Dict]:
+        """Find a workspace by exact name match (case-insensitive)."""
         name_lower = workspace_name.lower()
         return next((ws for ws in self.get_workspaces() if ws.get("name", "").lower() == name_lower), None)
     
     def get_workspace_projects(self, workspace_guid: str) -> List[Dict]:
+        """Get all projects in a workspace."""
         return self._get_all_pages(f"{self.ENDPOINTS['workspaces']}/{workspace_guid}/projects", "projects")
     
     def get_project_by_name(self, workspace_guid: str, project_name: str) -> Optional[Dict]:
+        """Find a project by exact name match (case-insensitive)."""
         name_lower = project_name.lower()
         return next(
             (p for p in self.get_workspace_projects(workspace_guid) if p.get("name", "").lower() == name_lower),
@@ -207,10 +287,12 @@ class VeracodeSBOMGenerator:
     
     def generate_agent_sbom(self, project_guid: str, sbom_format: str = "cyclonedx",
                             include_vulnerabilities: bool = True) -> Optional[Dict]:
+        """Generate SBOM for an agent-based scan project."""
         return self._get_sbom(project_guid, sbom_format, "agent", False, include_vulnerabilities)
     
     def generate_workspace_sboms(self, workspace_guid: str, sbom_format: str = "cyclonedx",
                                   include_vulnerabilities: bool = True) -> List[SBOMResult]:
+        """Generate SBOMs for all projects in a workspace."""
         projects = self.get_workspace_projects(workspace_guid)
         total = len(projects)
         logger.info("\nFound %d projects in workspace", total)
@@ -225,11 +307,15 @@ class VeracodeSBOMGenerator:
         return results
 
 
+# UI Helper Functions
+
 def clear_screen() -> None:
+    """Clear the terminal screen."""
     print("\033[2J\033[H", end="", flush=True)
 
 
 def print_header() -> None:
+    """Print the application header."""
     print("=" * 60)
     print("       VERACODE SBOM GENERATOR")
     print("=" * 60)
@@ -237,6 +323,7 @@ def print_header() -> None:
 
 
 def print_menu() -> None:
+    """Print the main menu."""
     print("\nMAIN MENU")
     print("-" * 40)
     print("  1. Application Profile SBOM")
@@ -250,6 +337,7 @@ def print_menu() -> None:
 
 
 def select_format() -> str:
+    """Prompt user to select SBOM format."""
     print("\nSELECT SBOM FORMAT")
     print("-" * 40)
     print("  1. CycloneDX (JSON)")
@@ -264,7 +352,8 @@ def select_format() -> str:
         print("Invalid choice. Please enter 1 or 2.")
 
 
-def select_options() -> Tuple[bool, bool]:
+def select_options() -> tuple:
+    """Prompt user for SBOM generation options."""
     print("\nSBOM OPTIONS")
     print("-" * 40)
     include_linked = input("Include linked agent-based results? [y/N]: ").strip().lower() == 'y'
@@ -272,10 +361,18 @@ def select_options() -> Tuple[bool, bool]:
     return include_linked, include_vulns
 
 
+def sanitize_filename(name: str) -> str:
+    """Sanitize a string for use as a filename."""
+    name = os.path.basename(name)
+    return UNSAFE_FILENAME_CHARS.sub('_', name)
+
+
 def save_sbom(sbom_data: Dict, filename: str, output_dir: str = ".") -> bool:
+    """Save SBOM data to a JSON file."""
     try:
         os.makedirs(output_dir, exist_ok=True)
-        filepath = os.path.join(output_dir, filename)
+        safe_filename = sanitize_filename(filename)
+        filepath = os.path.join(output_dir, safe_filename)
         with open(filepath, 'w', encoding='utf-8') as f:
             json.dump(sbom_data, f, indent=2)
         logger.info("   Saved: %s", filepath)
@@ -285,96 +382,271 @@ def save_sbom(sbom_data: Dict, filename: str, output_dir: str = ".") -> bool:
         return False
 
 
-def sanitize_filename(name: str) -> str:
-    return UNSAFE_FILENAME_CHARS.sub('_', name)
+def process_sbom_results(results: List[SBOMResult], output_dir: str) -> int:
+    """Save all successful SBOM results and return count."""
+    success_count = 0
+    for r in results:
+        if r.success:
+            filename = f"{sanitize_filename(r.name)}_sbom.json"
+            if save_sbom(r.sbom, filename, output_dir):
+                success_count += 1
+    return success_count
 
 
-def browse_and_select(items: List[Dict], item_type: str, name_key: str = "name", 
-                      id_key: str = "guid", allow_multi: bool = False) -> Optional[List[Dict]]:
-    """
-    Interactive browser for selecting items with filtering support.
-    Shows first 10 items, allows filtering by string if more than 10.
-    Returns list of selected items (single item in list if allow_multi=False).
-    """
-    if not items:
-        print(f"No {item_type}s found.")
-        return None
+# Interactive Browser
+
+@dataclass
+class BrowserState:
+    """State for the interactive browser."""
+    items: List[Dict]
+    filtered_items: List[Dict] = field(default_factory=list)
+    selected: List[Dict] = field(default_factory=list)
+    selected_ids: Set[str] = field(default_factory=set)
+    filter_str: str = ""
+    page: int = 0
     
-    total = len(items)
-    filtered_items = items
-    filter_str = ""
+    def __post_init__(self):
+        if not self.filtered_items:
+            self.filtered_items = self.items.copy()
+
+
+class ItemBrowser:
+    """Interactive browser for selecting items with filtering and pagination."""
     
-    while True:
-        print(f"\n{item_type.upper()}S ({len(filtered_items)} of {total})")
-        if filter_str:
-            print(f"Filter: '{filter_str}'")
-        print("-" * 50)
+    def __init__(self, items: List[Dict], item_type: str, 
+                 name_key: str = "name", id_key: str = "guid",
+                 allow_multi: bool = False) -> None:
+        self.items = items
+        self.item_type = item_type
+        self.name_key = name_key
+        self.id_key = id_key
+        self.allow_multi = allow_multi
+        self.state = BrowserState(items=items)
+    
+    def get_name(self, item: Dict) -> str:
+        if self.name_key == "profile":
+            return item.get("profile", {}).get("name", "Unknown")
+        return item.get(self.name_key, "Unknown")
+    
+    def get_id(self, item: Dict) -> str:
+        return item.get(self.id_key, "")
+    
+    @property
+    def total_pages(self) -> int:
+        return max(1, (len(self.state.filtered_items) + PAGE_SIZE - 1) // PAGE_SIZE)
+    
+    @property
+    def display_items(self) -> List[Dict]:
+        start = self.state.page * PAGE_SIZE
+        return self.state.filtered_items[start:start + PAGE_SIZE]
+    
+    @property
+    def start_index(self) -> int:
+        return self.state.page * PAGE_SIZE
+    
+    def display(self) -> None:
+        s = self.state
+        print(f"\n{self.item_type.upper()}S", end="")
+        if s.filter_str:
+            print(f" matching '{s.filter_str}'", end="")
+        print(f" ({len(s.filtered_items)} of {len(self.items)})")
+        if self.allow_multi and s.selected:
+            print(f"Selected: {len(s.selected)} item(s)")
+        print("-" * 55)
         
-        # Show up to 10 items
-        display_items = filtered_items[:10]
-        for i, item in enumerate(display_items, 1):
-            name = item.get(name_key, "Unknown")
-            if name_key == "profile":
-                name = item.get("profile", {}).get("name", "Unknown")
-            item_id = item.get(id_key, "N/A")
-            print(f"  {i:2d}. {name}")
-            print(f"      {id_key.upper()}: {item_id}")
+        if not self.display_items:
+            print("  No items to display.")
+        else:
+            for i, item in enumerate(self.display_items, self.start_index + 1):
+                marker = " [*]" if self.get_id(item) in s.selected_ids else ""
+                print(f"  {i:3d}. {self.get_name(item)}{marker}")
         
-        if len(filtered_items) > 10:
-            print(f"\n  ... and {len(filtered_items) - 10} more")
+        if self.total_pages > 1:
+            nav = []
+            if s.page > 0:
+                nav.append("[P]rev")
+            if s.page < self.total_pages - 1:
+                nav.append("[N]ext")
+            print(f"\n  Page {s.page + 1}/{self.total_pages}  {' / '.join(nav)}")
         
-        print("\n  [#] Select by number" + (" (comma-separated for multiple)" if allow_multi else ""))
-        print("  [text] Filter by name")
-        print("  [Enter] Clear filter" if filter_str else "")
+        print()
+        if self.allow_multi:
+            print("  [#] Add by number (1 or 1,3,5)   [R] Review selected")
+            print("  [A] Add all filtered             [D] Done - proceed")
+            print(f"  [C] Clear filter                 [X] Clear selection" if s.filter_str else 
+                  "                                   [X] Clear selection")
+        else:
+            print("  [#] Select by number    [text] Filter by name")
+            if s.filter_str:
+                print("  [C] Clear filter")
         print("  [0] Cancel")
+    
+    def apply_filter(self, text: str) -> None:
+        self.state.filter_str = text.lower()
+        self.state.filtered_items = [
+            item for item in self.items if self.state.filter_str in self.get_name(item).lower()
+        ]
+        self.state.page = 0
+        if not self.state.filtered_items:
+            print(f"  No matches for '{text}'")
+            self.clear_filter()
+    
+    def clear_filter(self) -> None:
+        self.state.filter_str = ""
+        self.state.filtered_items = self.items.copy()
+        self.state.page = 0
+    
+    def add_items(self, indices: List[int]) -> None:
+        for idx in indices:
+            if 1 <= idx <= len(self.state.filtered_items):
+                item = self.state.filtered_items[idx - 1]
+                item_id = self.get_id(item)
+                if item_id not in self.state.selected_ids:
+                    self.state.selected.append(item)
+                    self.state.selected_ids.add(item_id)
+                    print(f"  + {self.get_name(item)}")
+                else:
+                    print(f"  Already selected: {self.get_name(item)}")
+            else:
+                print(f"  Invalid: {idx}")
+        if indices:
+            print(f"  Total selected: {len(self.state.selected)}")
+    
+    def add_all_filtered(self) -> None:
+        added = 0
+        for item in self.state.filtered_items:
+            item_id = self.get_id(item)
+            if item_id not in self.state.selected_ids:
+                self.state.selected.append(item)
+                self.state.selected_ids.add(item_id)
+                added += 1
+        print(f"  Added {added} item(s). Total: {len(self.state.selected)}" if added else 
+              "  All filtered items already selected.")
+    
+    def review_selected(self) -> None:
+        if not self.state.selected:
+            print("  No items selected.")
+            return
         
-        choice = input(f"\nSelect {item_type} or filter: ").strip()
-        
-        if choice == "0":
+        review_page = 0
+        while self.state.selected:
+            total_pages = max(1, (len(self.state.selected) + PAGE_SIZE - 1) // PAGE_SIZE)
+            start = review_page * PAGE_SIZE
+            end = min(start + PAGE_SIZE, len(self.state.selected))
+            
+            print(f"\n=== SELECTED {self.item_type.upper()}S ({len(self.state.selected)} total) ===")
+            print("-" * 55)
+            for i, item in enumerate(self.state.selected[start:end], start + 1):
+                print(f"  {i:3d}. {self.get_name(item)}")
+            
+            if total_pages > 1:
+                nav = []
+                if review_page > 0:
+                    nav.append("[P]rev")
+                if review_page < total_pages - 1:
+                    nav.append("[N]ext")
+                print(f"\n  Page {review_page + 1}/{total_pages}  {' / '.join(nav)}")
+            
+            print("\n  [#] Remove (1 or 1,3,5)  [Enter] Back to browse")
+            choice = input("\n> ").strip()
+            
+            if choice == "":
+                break
+            if choice.upper() == "N" and review_page < total_pages - 1:
+                review_page += 1
+                continue
+            if choice.upper() == "P" and review_page > 0:
+                review_page -= 1
+                continue
+            
+            try:
+                to_remove = sorted(
+                    set(int(x.strip()) - 1 for x in choice.split(",") if x.strip().isdigit()),
+                    reverse=True
+                )
+                for idx in to_remove:
+                    if 0 <= idx < len(self.state.selected):
+                        removed = self.state.selected.pop(idx)
+                        self.state.selected_ids.discard(self.get_id(removed))
+                        print(f"  Removed: {self.get_name(removed)}")
+                if self.state.selected:
+                    print(f"  {len(self.state.selected)} item(s) remaining")
+                    review_page = min(review_page, (len(self.state.selected) - 1) // PAGE_SIZE)
+            except ValueError:
+                print("  Invalid input.")
+    
+    def run(self) -> Optional[List[Dict]]:
+        if not self.items:
+            print(f"No {self.item_type}s found.")
             return None
         
-        if choice == "" and filter_str:
-            # Clear filter
-            filter_str = ""
-            filtered_items = items
-            continue
-        
-        # Try to parse as number(s)
-        if choice.replace(",", "").replace(" ", "").isdigit() or (allow_multi and "," in choice):
-            try:
-                if allow_multi and "," in choice:
-                    indices = [int(x.strip()) - 1 for x in choice.split(",")]
-                    selected = [filtered_items[i] for i in indices if 0 <= i < len(display_items)]
-                    if selected:
-                        return selected
-                else:
-                    idx = int(choice) - 1
-                    if 0 <= idx < len(display_items):
-                        return [display_items[idx]]
-                print("Invalid selection.")
-            except (ValueError, IndexError):
-                print("Invalid selection.")
-            continue
-        
-        # Use as filter string
-        filter_str = choice.lower()
-        filtered_items = [
-            item for item in items
-            if filter_str in (item.get(name_key, "") if name_key != "profile" 
-                              else item.get("profile", {}).get("name", "")).lower()
-        ]
-        
-        if not filtered_items:
-            print(f"No {item_type}s match '{choice}'. Showing all.")
-            filter_str = ""
-            filtered_items = items
+        while True:
+            self.display()
+            choice = input("\n> ").strip()
+            
+            if not choice:
+                continue
+            
+            cmd = choice.upper()
+            
+            if choice == "0":
+                if self.allow_multi and self.state.selected:
+                    if input(f"Discard {len(self.state.selected)} selected? [y/N]: ").strip().lower() != 'y':
+                        continue
+                return None
+            
+            if cmd == "N" and self.state.page < self.total_pages - 1:
+                self.state.page += 1
+                continue
+            if cmd == "P" and self.state.page > 0:
+                self.state.page -= 1
+                continue
+            if cmd == "C" and self.state.filter_str:
+                self.clear_filter()
+                continue
+            
+            if self.allow_multi:
+                if cmd == "X":
+                    self.state.selected.clear()
+                    self.state.selected_ids.clear()
+                    print("  Selection cleared.")
+                    continue
+                if cmd == "D":
+                    return self.state.selected if self.state.selected else None
+                if cmd == "A":
+                    self.add_all_filtered()
+                    continue
+                if cmd == "R":
+                    self.review_selected()
+                    continue
+            
+            if any(c.isdigit() for c in choice):
+                try:
+                    nums = [int(x.strip()) for x in choice.replace(" ", ",").split(",") if x.strip().isdigit()]
+                    if self.allow_multi:
+                        self.add_items(nums)
+                    else:
+                        for num in nums:
+                            if 1 <= num <= len(self.state.filtered_items):
+                                return [self.state.filtered_items[num - 1]]
+                        print("  Invalid selection.")
+                    continue
+                except ValueError:
+                    pass
+            
+            self.apply_filter(choice)
 
 
-def process_sbom_results(results: List[SBOMResult], output_dir: str) -> int:
-    return sum(1 for r in results if r.sbom and save_sbom(r.sbom, f"{sanitize_filename(r.name)}_sbom.json", output_dir))
+def browse_and_select(items: List[Dict], item_type: str, name_key: str = "name",
+                      id_key: str = "guid", allow_multi: bool = False) -> Optional[List[Dict]]:
+    """Convenience function for interactive item selection."""
+    return ItemBrowser(items, item_type, name_key, id_key, allow_multi).run()
 
+
+# Main Application Modes
 
 def interactive_mode(generator: VeracodeSBOMGenerator) -> None:
+    """Run the interactive menu mode."""
     while True:
         clear_screen()
         print_header()
@@ -397,7 +669,6 @@ def interactive_mode(generator: VeracodeSBOMGenerator) -> None:
                 continue
             
             app = selected[0]
-            app_guid = app.get("guid")
             app_name = app.get("profile", {}).get("name", "Unknown")
             print(f"\nSelected: {app_name}")
             
@@ -405,7 +676,7 @@ def interactive_mode(generator: VeracodeSBOMGenerator) -> None:
             include_linked, include_vulns = select_options()
             
             print(f"\nGenerating {sbom_format.upper()} SBOM...")
-            sbom = generator.generate_app_sbom(app_guid, sbom_format, include_linked, include_vulns)
+            sbom = generator.generate_app_sbom(app.get("guid"), sbom_format, include_linked, include_vulns)
             
             if sbom:
                 timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
@@ -436,7 +707,6 @@ def interactive_mode(generator: VeracodeSBOMGenerator) -> None:
             for i, app in enumerate(selected, 1):
                 app_name = app.get("profile", {}).get("name", "Unknown")
                 print(f"\n[{i}/{len(selected)}] Processing: {app_name}")
-                
                 sbom = generator.generate_app_sbom(app.get("guid"), sbom_format, include_linked, include_vulns)
                 if sbom and save_sbom(sbom, f"{sanitize_filename(app_name)}_sbom_{timestamp}.json", "sbom_output"):
                     success_count += 1
@@ -547,6 +817,7 @@ def interactive_mode(generator: VeracodeSBOMGenerator) -> None:
 
 
 def command_line_mode(args: argparse.Namespace) -> None:
+    """Run in command-line (non-interactive) mode."""
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     output_dir = args.output or "sbom_output"
     
@@ -626,16 +897,17 @@ def command_line_mode(args: argparse.Namespace) -> None:
 
 
 def main() -> None:
+    """Main entry point."""
     parser = argparse.ArgumentParser(
         description="Veracode SBOM Generator",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Examples:
-  Interactive mode:     python veracode_sbom_generator.py
-  Single application:   python veracode_sbom_generator.py --app "MyApp" --format cyclonedx
-  Collection:           python veracode_sbom_generator.py --collection "MyCollection" --format spdx
-  Agent project:        python veracode_sbom_generator.py --workspace "MyWorkspace" --project "MyProject"
-  All workspace:        python veracode_sbom_generator.py --workspace "MyWorkspace"
+  Interactive mode:     python script.py
+  Single application:   python script.py --app "MyApp" --format cyclonedx
+  Collection:           python script.py --collection "MyCollection" --format spdx
+  Agent project:        python script.py --workspace "MyWorkspace" --project "MyProject"
+  All workspace:        python script.py --workspace "MyWorkspace"
         """
     )
     
