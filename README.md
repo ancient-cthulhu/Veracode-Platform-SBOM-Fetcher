@@ -1,109 +1,210 @@
 # Veracode SBOM Generator
 
-Generate Software Bills of Materials (SBOMs) from the Veracode platform via CLI.
+Generate SBOMs from the Veracode platform for applications, collections, and SCA workspaces. Supports both interactive and command-line modes.
 
-## Prerequisites
+---
 
-**API Credentials** - Requires one of:
-- API Service Account with **Results API** role
-- User Account with **Administrator**, **Reviewer**, or **Security Lead** role
+## How It Works
 
-**Setup:**
-```ini
-# ~/.veracode/credentials (Mac/Linux)
-# C:\Users\<username>\.veracode\credentials (Windows)
+The script connects to the Veracode API and generates Software Bill of Materials (SBOM) files in CycloneDX or SPDX format for:
 
-[default]
-veracode_api_key_id = YOUR_API_KEY_ID
-veracode_api_key_secret = YOUR_API_KEY_SECRET
+- **Application Profiles** - Upload/policy scan results
+- **Collections** - All applications in a collection
+- **SCA Workspaces** - Agent-based scan projects
+
+> **Note:** SBOM generation requires a scan completed within the last 13 months. Applications with older scans are marked as "stale" and cannot be used for SBOM generation until rescanned.
+
+---
+
+## Quickstart
+
+### Interactive mode
+
+```bash
+python veracode_sbom_generator.py
 ```
 
-**Install:**
+### Single application
+
 ```bash
+python veracode_sbom_generator.py --app "MyApp" --format cyclonedx
+```
+
+### Collection (all applications)
+
+```bash
+python veracode_sbom_generator.py --collection "MyCollection" --format spdx
+```
+
+### SCA workspace project
+
+```bash
+python veracode_sbom_generator.py --workspace "MyWorkspace" --project "MyProject"
+```
+
+### All projects in a workspace
+
+```bash
+python veracode_sbom_generator.py --workspace "MyWorkspace"
+```
+
+---
+
+## Requirements
+
+```bash
+python --version  # Python 3.8+
 pip install requests veracode-api-signing
 ```
 
-## Features
+---
 
-- **Multiple Targets**: Single app, multiple apps, collections, agent-based projects, entire workspaces
-- **SBOM Formats**: CycloneDX v1.4 and SPDX v2.3 (JSON)
-- **Multi-Region**: Commercial, European, and Federal regions
-- **Interactive CLI**: Menu-driven interface or scriptable command-line mode
+## Credentials
 
-## Quick Start
+### Environment variables
 
-**Interactive mode:**
 ```bash
-python script.py
+export VERACODE_API_KEY_ID=your_api_key_id
+export VERACODE_API_KEY_SECRET=your_api_key_secret
 ```
 
-**Single application:**
-```bash
-python script.py --app "MyApp" --format cyclonedx
+### Credentials file
+
+Create `~/.veracode/credentials`:
+
+```ini
+[default]
+veracode_api_key_id = your_api_key_id
+veracode_api_key_secret = your_api_key_secret
 ```
 
-**Collection:**
-```bash
-python script.py --collection "MyCollection" --format spdx
+---
+
+## Command-Line Reference
+
+| Flag | Description |
+|------|-------------|
+| `--app`, `-a` | Application profile name |
+| `--collection`, `-c` | Collection name |
+| `--workspace`, `-w` | SCA workspace name |
+| `--project`, `-p` | SCA project name (requires `--workspace`) |
+| `--format`, `-f` | SBOM format: `cyclonedx` (default) or `spdx` |
+| `--linked`, `-l` | Include linked agent-based scan results |
+| `--no-vulns` | Exclude vulnerability information |
+| `--output`, `-o` | Output directory (default: `sbom_output`) |
+| `--region`, `-r` | Veracode region: `commercial` (default), `european`, or `federal` |
+
+---
+
+## Stale Application Handling
+
+SBOM generation requires a scan within the last 13 months. Applications with older or missing scans are "stale."
+
+| Mode | Behavior |
+|------|----------|
+| Interactive | Stale apps shown with `[STALE]` marker, cannot be selected |
+| CLI `--app` | Hard exit if application is stale |
+| CLI `--collection` | Warning displayed, stale apps skipped automatically. Hard exit if all apps are stale. |
+
+**To resolve:** Rescan the application in Veracode, then re-run the generator.
+
+---
+
+## Interactive Mode Features
+
+### Main Menu
+
+```
+MAIN MENU
+----------------------------------------
+  1. Application Profile SBOM
+  2. Multiple Application SBOMs
+  3. Collection SBOMs
+  4. Agent-Based Project SBOM
+  5. Workspace SBOMs (All Projects)
+----------------------------------------
+  0. Exit
 ```
 
-**Agent-based project:**
-```bash
-python script.py --workspace "MyWorkspace" --project "MyProject"
-```
+### Browser Controls
 
-**All projects in workspace:**
-```bash
-python script.py --workspace "MyWorkspace"
-```
+| Key | Action |
+|-----|--------|
+| `#` | Select by number (single) or add by number (multi-select) |
+| `1,3,5` | Add multiple items by number |
+| `N` / `P` | Next / Previous page |
+| `A` | Add all eligible items (multi-select mode) |
+| `R` | Review selected items |
+| `D` | Done - proceed with selection |
+| `X` | Clear selection |
+| `C` | Clear filter |
+| `text` | Filter by name |
+| `0` | Cancel |
 
-## Command-Line Arguments
-
-| Argument | Short | Default | Description |
-|----------|-------|---------|-------------|
-| `--app` | `-a` | - | Application profile name |
-| `--collection` | `-c` | - | Collection name |
-| `--workspace` | `-w` | - | SCA workspace name |
-| `--project` | `-p` | - | SCA project name (requires `--workspace`) |
-| `--format` | `-f` | `cyclonedx` | SBOM format: `cyclonedx` or `spdx` |
-| `--linked` | `-l` | `false` | Include linked agent-based scan results |
-| `--no-vulns` | - | `false` | Exclude vulnerability information |
-| `--output` | `-o` | `sbom_output` | Output directory |
-| `--region` | `-r` | `commercial` | Region: `commercial`, `european`, `federal` |
+---
 
 ## Output
 
-SBOMs are saved to `sbom_output/` directory:
+SBOMs are saved to `sbom_output/` by default (override with `--output`).
 
-| Target | Output Path |
-|--------|-------------|
-| Single app | `sbom_output/<app_name>_sbom_<timestamp>.json` |
-| Collection | `sbom_output/collection_<name>_<timestamp>/<app>_sbom.json` |
-| Workspace | `sbom_output/workspace_<name>_<timestamp>/<project>_sbom.json` |
+### File naming
 
-## API Endpoints
+| Mode | Pattern |
+|------|---------|
+| Single app | `{app_name}_sbom_{timestamp}.json` |
+| Collection | `collection_{name}_{timestamp}/{app_name}_sbom.json` |
+| Workspace | `workspace_{name}_{timestamp}/{project_name}_sbom.json` |
+| Agent project | `{project_name}_agent_sbom_{timestamp}.json` |
 
-| Feature | Endpoint |
-|---------|----------|
-| Applications | `GET /appsec/v1/applications` |
-| Collections | `GET /appsec/v1/collections` |
-| Collection Assets | `GET /appsec/v1/collections/{guid}/assets` |
-| Workspaces | `GET /srcclr/v3/workspaces` |
-| Projects | `GET /srcclr/v3/workspaces/{guid}/projects` |
-| SBOM (Application) | `GET /srcclr/sbom/v1/targets/{guid}/cyclonedx?type=application` |
-| SBOM (Agent) | `GET /srcclr/sbom/v1/targets/{guid}/cyclonedx?type=agent` |
+---
+
+## Regions
+
+| Region | Flag | API Endpoint |
+|--------|------|--------------|
+| Commercial (US) | `--region commercial` | `api.veracode.com` |
+| European | `--region european` | `api.veracode.eu` |
+| Federal | `--region federal` | `api.veracode.us` |
+
+---
 
 ## Troubleshooting
 
-| Issue | Solution |
-|-------|----------|
-| 401 Authentication failed | Verify API credentials in `~/.veracode/credentials` |
-| 403 Access denied | Confirm account has required roles |
-| No SCA results | Ensure at least one SCA scan completed in last 13 months |
-| Collections not found | Collections require Early Adopter program access |
+- **"Authentication failed. Check your API credentials."**
+  - Verify `VERACODE_API_KEY_ID` and `VERACODE_API_KEY_SECRET` are set correctly, or check `~/.veracode/credentials`
 
-## References
+- **"Application 'X' is stale"**
+  - The application has not been scanned in 13+ months. Rescan it in Veracode.
 
-- [Veracode SBOM API](https://docs.veracode.com/r/Generate_an_SBOM_with_the_REST_API)
-- [API Authentication](https://docs.veracode.com/r/c_enabling_hmac)
-- [veracode-api-signing](https://pypi.org/project/veracode-api-signing/)
+- **"All applications in collection 'X' are stale"**
+  - No applications in the collection have recent scans. Rescan at least one application.
+
+- **"Resource not found"**
+  - The application, collection, workspace, or project name may be misspelled or you may lack access
+
+- **"Rate limit exceeded"**
+  - The script automatically waits and retries. For large batch operations, consider spacing requests
+
+- **Empty SBOM or no components**
+  - The scan may not have detected any dependencies. Verify the scan completed successfully in Veracode.
+
+- **"Required packages not installed"**
+  - Run: `pip install requests veracode-api-signing`
+
+---
+
+## SBOM Formats
+
+### CycloneDX (default)
+
+Industry-standard format with strong support for vulnerability tracking. Recommended for most use cases.
+
+### SPDX
+
+ISO/IEC standard format. Use when SPDX compliance is required.
+
+Both formats are output as JSON files.
+
+---
+
+Supported platforms: Veracode Commercial · Veracode European · Veracode Federal
