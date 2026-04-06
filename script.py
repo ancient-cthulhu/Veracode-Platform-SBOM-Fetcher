@@ -1,4 +1,3 @@
-
 #!/usr/bin/env python3
 """Veracode SBOM Generator - Generate SBOMs from Veracode platform."""
 
@@ -11,7 +10,7 @@ import logging
 import argparse
 from datetime import datetime, timedelta, UTC
 from dataclasses import dataclass, field
-from typing import Optional, List, Dict, Set
+from typing import Optional, List, Dict, Set, Tuple
 from urllib.parse import urlparse, parse_qs
 
 try:
@@ -34,6 +33,7 @@ MAX_RETRIES = 3
 RETRY_BACKOFF_FACTOR = 1.0
 RATE_LIMIT_DELAY = 0.2
 PAGE_SIZE = 10
+SBOM_ELIGIBILITY_DAYS = 395  # ~13 months
 
 
 @dataclass
@@ -43,10 +43,67 @@ class SBOMResult:
     name: str
     sbom: Optional[Dict] = None
     error: Optional[str] = None
+    skipped_stale: bool = False
 
     @property
     def success(self) -> bool:
         return self.sbom is not None and bool(self.sbom)
+
+
+def get_sbom_cutoff_date() -> datetime:
+    """Return the cutoff date for SBOM eligibility (13 months ago)."""
+    return datetime.now(UTC) - timedelta(days=SBOM_ELIGIBILITY_DAYS)
+
+
+def is_app_stale(app: Dict) -> bool:
+    """Check if an application's last scan is older than 13 months."""
+    raw = app.get("last_completed_scan_date")
+    if not raw:
+        return True  # No scan date means stale
+    try:
+        scan_dt = datetime.fromisoformat(raw.replace("Z", "+00:00"))
+    except ValueError:
+        try:
+            scan_dt = datetime.strptime(raw[:10], "%Y-%m-%d").replace(tzinfo=UTC)
+        except ValueError:
+            return True
+    return scan_dt < get_sbom_cutoff_date()
+
+
+def get_stale_app_message(app_name: str) -> str:
+    """Return the standard message for stale applications."""
+    return (
+        f"Application '{app_name}' has not been scanned in the last 13 months.\n"
+        f"SBOM generation requires a recent scan. Please rescan this application\n"
+        f"in Veracode and try again."
+    )
+
+
+def get_stale_apps_warning(stale_apps: List[Dict], name_key: str = "name") -> str:
+    """Generate a warning message listing stale applications."""
+    lines = [
+        "",
+        "=" * 60,
+        "  WARNING: The following applications have not been scanned",
+        "  in the last 13 months and cannot be used for SBOM generation:",
+        "-" * 60,
+    ]
+    for app in stale_apps[:10]:  # Limit to first 10
+        if name_key == "profile":
+            name = app.get("profile", {}).get("name", "Unknown")
+        else:
+            name = app.get(name_key, "Unknown")
+        lines.append(f"    - {name}")
+    if len(stale_apps) > 10:
+        lines.append(f"    ... and {len(stale_apps) - 10} more")
+    lines.extend([
+        "-" * 60,
+        "  ACTION REQUIRED: Rescan these applications in Veracode",
+        "  to enable SBOM generation.",
+        "=" * 60,
+        "",
+    ])
+    return "\n".join(lines)
 
 
 class VeracodeSBOMGenerator:
@@ -143,7 +200,6 @@ class VeracodeSBOMGenerator:
                     continue
             except requests.exceptions.HTTPError as e:
                 status = e.response.status_code if e.response is not None else "unknown"
-                # Try to extract a human-readable detail from Veracode's error envelope
                 detail = ""
                 if e.response is not None:
                     try:
@@ -210,62 +266,43 @@ class VeracodeSBOMGenerator:
 
     def _get_sbom(self, target_guid: str, sbom_format: str, target_type: str = "application",
                   include_linked: bool = False, include_vulnerabilities: bool = True) -> Optional[Dict]:
-        """Fetch SBOM for a target.
-
-        Endpoint: /srcclr/sbom/v1/targets/{guid}/{format}
-
-        Valid query params:
-          type         — "application" (upload/policy scans) or "agent" (agent-based scans)
-          linked       — "true" only when type=application and linked agent results are wanted
-          vulnerability — "false" only when explicitly excluding; API default is true, so we
-                          omit the param entirely when including vulns to avoid sending noise
-        """
+        """Fetch SBOM for a target."""
         endpoint = f"/srcclr/sbom/v1/targets/{target_guid}/{sbom_format}"
         params: Dict[str, str] = {"type": target_type}
 
-        # Only send vulnerability=false when explicitly excluding.
-        # The API default is true, so omitting it is equivalent — and avoids
-        # any gateway behaviour that rejects redundant params.
         if not include_vulnerabilities:
             params["vulnerability"] = "false"
 
-        # linked is only meaningful for application-type requests and only
-        # when the caller explicitly wants linked agent-based results.
         if target_type == "application" and include_linked:
             params["linked"] = "true"
 
         result = self._make_request(endpoint, params)
         return result if result else None
 
-    def get_applications(self, name_filter: Optional[str] = None, page_size: int = 100) -> List[Dict]:
-        """Get applications with an SCA-eligible scan in the last 13 months."""
-        cutoff = datetime.now(UTC) - timedelta(days=395)
-        params: Dict = {
-            "size": page_size,
-            "modified_after": cutoff.strftime("%Y-%m-%d"),
-        }
+    def get_applications(self, name_filter: Optional[str] = None, page_size: int = 100,
+                         include_stale: bool = True) -> List[Dict]:
+        """Get applications, marking stale ones with _is_stale flag.
+        
+        Args:
+            name_filter: Optional name filter
+            page_size: Page size for API requests
+            include_stale: If True, include stale apps marked with _is_stale=True.
+                          If False, only return eligible apps.
+        """
+        params: Dict = {"size": page_size}
         if name_filter:
             params["name"] = name_filter
-    
+
         apps = self._get_all_pages(self.ENDPOINTS["applications"], "applications", params)
-    
-        filtered: List[Dict] = []
+
+        # Mark each app with staleness flag
         for app in apps:
-            raw = app.get("last_completed_scan_date")
-            if not raw:
-                continue
-            try:
-                scan_dt = datetime.fromisoformat(raw.replace("Z", "+00:00"))
-            except ValueError:
-                try:
-                    scan_dt = datetime.strptime(raw[:10], "%Y-%m-%d").replace(tzinfo=UTC)
-                except ValueError:
-                    continue
-    
-            if scan_dt >= cutoff:
-                filtered.append(app)
-    
-        return filtered
+            app["_is_stale"] = is_app_stale(app)
+
+        if not include_stale:
+            return [app for app in apps if not app.get("_is_stale")]
+
+        return apps
 
     def get_application_by_name(self, app_name: str) -> Optional[Dict]:
         """Find an application by exact name match (case-insensitive)."""
@@ -292,24 +329,55 @@ class VeracodeSBOMGenerator:
         return next((c for c in self.get_collections() if c.get("name", "").lower() == name_lower), None)
 
     def get_collection_assets(self, collection_guid: str) -> List[Dict]:
-        """Get all assets in a collection."""
-        return self._get_all_pages(f"{self.ENDPOINTS['collections']}/{collection_guid}/assets", "assets")
+        """Get all assets in a collection, marking stale ones."""
+        assets = self._get_all_pages(f"{self.ENDPOINTS['collections']}/{collection_guid}/assets", "assets")
+        for asset in assets:
+            asset["_is_stale"] = is_app_stale(asset)
+        return assets
 
     def generate_collection_sboms(self, collection_guid: str, sbom_format: str = "cyclonedx",
                                    include_linked: bool = False,
-                                   include_vulnerabilities: bool = True) -> List[SBOMResult]:
-        """Generate SBOMs for all applications in a collection."""
+                                   include_vulnerabilities: bool = True,
+                                   skip_stale: bool = True) -> List[SBOMResult]:
+        """Generate SBOMs for all applications in a collection.
+        
+        Args:
+            skip_stale: If True, skip stale apps and mark them in results.
+                       If False, attempt generation (will likely fail).
+        """
         assets = self.get_collection_assets(collection_guid)
         total = len(assets)
+        stale_assets = [a for a in assets if a.get("_is_stale")]
+        eligible_assets = [a for a in assets if not a.get("_is_stale")]
+
         logger.info("\nFound %d applications in collection", total)
+        if stale_assets:
+            logger.info("  - %d eligible for SBOM generation", len(eligible_assets))
+            logger.info("  - %d stale (last scan > 13 months ago)", len(stale_assets))
 
         results: List[SBOMResult] = []
-        for i, asset in enumerate(assets, 1):
+
+        # Process stale assets first (mark as skipped)
+        if skip_stale:
+            for asset in stale_assets:
+                app_guid = asset.get("guid", "")
+                app_name = asset.get("name", "Unknown")
+                results.append(SBOMResult(
+                    guid=app_guid,
+                    name=app_name,
+                    error="Stale application (not scanned in 13 months)",
+                    skipped_stale=True
+                ))
+
+        # Process eligible assets
+        assets_to_process = eligible_assets if skip_stale else assets
+        for i, asset in enumerate(assets_to_process, 1):
             app_guid = asset.get("guid", "")
             app_name = asset.get("name", "Unknown")
-            logger.info("   [%d/%d] Generating SBOM for: %s", i, total, app_name)
+            logger.info("   [%d/%d] Generating SBOM for: %s", i, len(assets_to_process), app_name)
             sbom = self.generate_app_sbom(app_guid, sbom_format, include_linked, include_vulnerabilities)
             results.append(SBOMResult(guid=app_guid, name=app_name, sbom=sbom))
+
         return results
 
     def get_workspaces(self) -> List[Dict]:
@@ -324,24 +392,18 @@ class VeracodeSBOMGenerator:
     @staticmethod
     def _workspace_guid(workspace: Dict) -> str:
         """Return the UUID for a workspace object.
-
-        The srcclr /v3/workspaces response has two identifier fields:
-          "id"   — legacy string slug (e.g. "my-workspace"), NOT for use in URLs
-          "guid" — UUID required in all API path segments
+        
+        The srcclr /v3/workspaces API returns 'id' as the UUID field.
         """
-        return workspace.get("guid", "")
+        return workspace.get("id", "")
 
     @staticmethod
     def _project_guid(project: Dict) -> str:
-        """Return the UUID for a project object.
-
-        The srcclr /v3/workspaces/{guid}/projects response uses "id" for the
-        project UUID (there is no separate "guid" key on project objects).
-        """
+        """Return the UUID for a project object."""
         return project.get("id", "")
 
     def get_workspace_projects(self, workspace_guid: str) -> List[Dict]:
-        """Get all projects in a workspace. Pass the workspace UUID ("guid" field)."""
+        """Get all projects in a workspace."""
         return self._get_all_pages(f"{self.ENDPOINTS['workspaces']}/{workspace_guid}/projects", "projects")
 
     def get_project_by_name(self, workspace_guid: str, project_name: str) -> Optional[Dict]:
@@ -354,10 +416,7 @@ class VeracodeSBOMGenerator:
 
     def generate_agent_sbom(self, project_guid: str, sbom_format: str = "cyclonedx",
                             include_vulnerabilities: bool = True) -> Optional[Dict]:
-        """Generate SBOM for an agent-based scan project.
-
-        Uses type=agent. The linked param is not applicable here.
-        """
+        """Generate SBOM for an agent-based scan project."""
         return self._get_sbom(project_guid, sbom_format, "agent", False, include_vulnerabilities)
 
     def generate_workspace_sboms(self, workspace_guid: str, sbom_format: str = "cyclonedx",
@@ -389,6 +448,13 @@ def print_error(msg: str) -> None:
     print(f"\n{'!' * 60}")
     print(f"  ERROR: {msg}")
     print("!" * 60)
+
+
+def print_warning(msg: str) -> None:
+    """Print a warning message."""
+    print(f"\n{'*' * 60}")
+    print(f"  WARNING: {msg}")
+    print("*" * 60)
 
 
 def print_success(msg: str) -> None:
@@ -466,15 +532,19 @@ def save_sbom(sbom_data: Dict, filename: str, output_dir: str = ".") -> bool:
         return False
 
 
-def process_sbom_results(results: List[SBOMResult], output_dir: str) -> int:
-    """Save all successful SBOM results and return count."""
+def process_sbom_results(results: List[SBOMResult], output_dir: str) -> Tuple[int, int]:
+    """Save all successful SBOM results and return (success_count, skipped_stale_count)."""
     success_count = 0
+    skipped_stale_count = 0
     for r in results:
+        if r.skipped_stale:
+            skipped_stale_count += 1
+            continue
         if r.success:
             filename = f"{sanitize_filename(r.name)}_sbom.json"
             if save_sbom(r.sbom, filename, output_dir):
                 success_count += 1
-    return success_count
+    return success_count, skipped_stale_count
 
 
 # Interactive Browser
@@ -499,12 +569,14 @@ class ItemBrowser:
 
     def __init__(self, items: List[Dict], item_type: str,
                  name_key: str = "name", id_key: str = "guid",
-                 allow_multi: bool = False) -> None:
+                 allow_multi: bool = False,
+                 stale_key: str = "_is_stale") -> None:
         self.items = items
         self.item_type = item_type
         self.name_key = name_key
         self.id_key = id_key
         self.allow_multi = allow_multi
+        self.stale_key = stale_key
         self.state = BrowserState(items=items)
 
     def get_name(self, item: Dict) -> str:
@@ -515,8 +587,12 @@ class ItemBrowser:
     def get_id(self, item: Dict) -> str:
         return item.get(self.id_key, "")
 
+    def is_stale(self, item: Dict) -> bool:
+        """Check if item is stale (unselectable)."""
+        return item.get(self.stale_key, False)
+
     def get_subtitle(self, item: Dict) -> str:
-        """Return a secondary display string for the item, e.g. last scan date."""
+        """Return a secondary display string for the item."""
         raw = item.get("last_completed_scan_date", "")
         if not raw:
             return ""
@@ -539,14 +615,31 @@ class ItemBrowser:
     def start_index(self) -> int:
         return self.state.page * PAGE_SIZE
 
+    @property
+    def stale_count(self) -> int:
+        """Count of stale items in current filtered list."""
+        return sum(1 for item in self.state.filtered_items if self.is_stale(item))
+
+    @property
+    def eligible_count(self) -> int:
+        """Count of eligible (non-stale) items in current filtered list."""
+        return len(self.state.filtered_items) - self.stale_count
+
     def display(self) -> None:
         s = self.state
         print(f"\n{self.item_type.upper()}S", end="")
         if s.filter_str:
             print(f" matching '{s.filter_str}'", end="")
-        print(f" with SBOM available ({len(s.filtered_items)})")
-        if self.item_type.lower() == "application":
-            print("  (showing only apps with a scan in the last 13 months)")
+        print(f" ({len(s.filtered_items)} total)")
+
+        # Show stale warning if applicable
+        if self.stale_count > 0:
+            print("-" * 55)
+            print(f"  NOTE: {self.eligible_count} eligible for SBOM | "
+                  f"{self.stale_count} STALE (marked with [STALE])")
+            print("  Stale apps have not been scanned in 13+ months.")
+            print("  To enable SBOM generation, rescan these apps in Veracode.")
+
         if self.allow_multi and s.selected:
             print(f"Selected: {len(s.selected)} item(s)")
         print("-" * 55)
@@ -555,10 +648,17 @@ class ItemBrowser:
             print("  No items to display.")
         else:
             for i, item in enumerate(self.display_items, self.start_index + 1):
+                is_item_stale = self.is_stale(item)
                 marker = " [*]" if self.get_id(item) in s.selected_ids else ""
+                stale_marker = " [STALE]" if is_item_stale else ""
                 subtitle = self.get_subtitle(item)
                 suffix = f"  (last scan: {subtitle})" if subtitle else ""
-                print(f"  {i:3d}. {self.get_name(item)}{suffix}{marker}")
+
+                if is_item_stale:
+                    # Dim/strike-through effect using prefix
+                    print(f"  {i:3d}. {self.get_name(item)}{suffix}{stale_marker}")
+                else:
+                    print(f"  {i:3d}. {self.get_name(item)}{suffix}{marker}")
 
         if self.total_pages > 1:
             nav = []
@@ -571,7 +671,7 @@ class ItemBrowser:
         print()
         if self.allow_multi:
             print("  [#] Add by number (1 or 1,3,5)   [R] Review selected")
-            print("  [A] Add all filtered             [D] Done - proceed")
+            print("  [A] Add all eligible             [D] Done - proceed")
             print(f"  [C] Clear filter                 [X] Clear selection" if s.filter_str else
                   "                                   [X] Clear selection")
         else:
@@ -599,6 +699,13 @@ class ItemBrowser:
         for idx in indices:
             if 1 <= idx <= len(self.state.filtered_items):
                 item = self.state.filtered_items[idx - 1]
+
+                # Block stale items
+                if self.is_stale(item):
+                    print(f"  BLOCKED: '{self.get_name(item)}' is stale (not scanned in 13+ months).")
+                    print(f"           Rescan this application in Veracode to enable SBOM generation.")
+                    continue
+
                 item_id = self.get_id(item)
                 if item_id not in self.state.selected_ids:
                     self.state.selected.append(item)
@@ -612,15 +719,26 @@ class ItemBrowser:
             print(f"  Total selected: {len(self.state.selected)}")
 
     def add_all_filtered(self) -> None:
+        """Add all eligible (non-stale) filtered items."""
         added = 0
+        skipped_stale = 0
         for item in self.state.filtered_items:
+            if self.is_stale(item):
+                skipped_stale += 1
+                continue
             item_id = self.get_id(item)
             if item_id not in self.state.selected_ids:
                 self.state.selected.append(item)
                 self.state.selected_ids.add(item_id)
                 added += 1
-        print(f"  Added {added} item(s). Total: {len(self.state.selected)}" if added else
-              "  All filtered items already selected.")
+
+        if added:
+            print(f"  Added {added} eligible item(s). Total: {len(self.state.selected)}")
+        else:
+            print("  All eligible items already selected.")
+
+        if skipped_stale:
+            print(f"  Skipped {skipped_stale} stale item(s) (not scanned in 13+ months).")
 
     def review_selected(self) -> None:
         if not self.state.selected:
@@ -727,8 +845,18 @@ class ItemBrowser:
                     else:
                         for num in nums:
                             if 1 <= num <= len(self.state.filtered_items):
-                                return [self.state.filtered_items[num - 1]]
-                        print("  Invalid selection.")
+                                item = self.state.filtered_items[num - 1]
+                                # Block stale items in single-select mode
+                                if self.is_stale(item):
+                                    print(f"\n  BLOCKED: '{self.get_name(item)}' is stale.")
+                                    print(f"  This application has not been scanned in the last 13 months.")
+                                    print(f"  SBOM generation requires a recent scan.")
+                                    print(f"  ACTION: Rescan this application in Veracode and try again.")
+                                    input("\n  Press Enter to continue...")
+                                    break
+                                return [item]
+                        else:
+                            print("  Invalid selection.")
                     continue
                 except ValueError:
                     pass
@@ -737,9 +865,10 @@ class ItemBrowser:
 
 
 def browse_and_select(items: List[Dict], item_type: str, name_key: str = "name",
-                      id_key: str = "guid", allow_multi: bool = False) -> Optional[List[Dict]]:
+                      id_key: str = "guid", allow_multi: bool = False,
+                      stale_key: str = "_is_stale") -> Optional[List[Dict]]:
     """Convenience function for interactive item selection."""
-    return ItemBrowser(items, item_type, name_key, id_key, allow_multi).run()
+    return ItemBrowser(items, item_type, name_key, id_key, allow_multi, stale_key).run()
 
 
 # Main Application Modes
@@ -759,8 +888,13 @@ def interactive_mode(generator: VeracodeSBOMGenerator) -> None:
         elif choice == "1":
             print("\nAPPLICATION PROFILE SBOM")
             print("-" * 40)
-            print("Fetching applications (last 13 months)...")
-            apps = generator.get_applications()
+            print("Fetching applications...")
+            apps = generator.get_applications(include_stale=True)
+
+            # Show warning if there are stale apps
+            stale_apps = [a for a in apps if a.get("_is_stale")]
+            if stale_apps:
+                print(get_stale_apps_warning(stale_apps, name_key="profile"))
 
             selected = browse_and_select(apps, "application", name_key="profile", id_key="guid")
             if not selected:
@@ -790,8 +924,13 @@ def interactive_mode(generator: VeracodeSBOMGenerator) -> None:
         elif choice == "2":
             print("\nMULTIPLE APPLICATION SBOMS")
             print("-" * 40)
-            print("Fetching applications (last 13 months)...")
-            apps = generator.get_applications()
+            print("Fetching applications...")
+            apps = generator.get_applications(include_stale=True)
+
+            # Show warning if there are stale apps
+            stale_apps = [a for a in apps if a.get("_is_stale")]
+            if stale_apps:
+                print(get_stale_apps_warning(stale_apps, name_key="profile"))
 
             selected = browse_and_select(apps, "application", name_key="profile", id_key="guid", allow_multi=True)
             if not selected:
@@ -837,7 +976,8 @@ def interactive_mode(generator: VeracodeSBOMGenerator) -> None:
             print("Fetching collections...")
             collections = generator.get_collections()
 
-            selected = browse_and_select(collections, "collection", name_key="name", id_key="guid")
+            selected = browse_and_select(collections, "collection", name_key="name", id_key="guid",
+                                         stale_key="_nonexistent")  # Collections don't have stale flag
             if not selected:
                 print("\nNo collection selected.")
                 input("\nPress Enter to continue...")
@@ -847,25 +987,43 @@ def interactive_mode(generator: VeracodeSBOMGenerator) -> None:
             collection_name = collection.get("name", "Unknown")
             print(f"\nSelected: {collection_name}")
 
+            # Check for stale assets in collection before proceeding
+            print("\nChecking collection assets...")
+            assets = generator.get_collection_assets(collection.get("guid"))
+            stale_assets = [a for a in assets if a.get("_is_stale")]
+
+            if stale_assets:
+                print(get_stale_apps_warning(stale_assets, name_key="name"))
+                print(f"  {len(assets) - len(stale_assets)} of {len(assets)} applications are eligible.")
+                proceed = input("\nProceed with eligible applications only? [Y/n]: ").strip().lower()
+                if proceed == 'n':
+                    print("\nOperation cancelled.")
+                    input("\nPress Enter to continue...")
+                    continue
+
             sbom_format = select_format()
             include_linked, include_vulns = select_options()
             print("\nGenerating SBOMs for collection...")
 
-            results = generator.generate_collection_sboms(collection.get("guid"), sbom_format, include_linked, include_vulns)
+            results = generator.generate_collection_sboms(
+                collection.get("guid"), sbom_format, include_linked, include_vulns, skip_stale=True
+            )
             timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
             output_dir = f"sbom_output/collection_{sanitize_filename(collection_name)}_{timestamp}"
-            success_count = process_sbom_results(results, output_dir)
-            failed_count = len(results) - success_count
+            success_count, skipped_stale = process_sbom_results(results, output_dir)
+            failed_count = len(results) - success_count - skipped_stale
 
-            if success_count == len(results):
-                print_success(f"All {success_count} SBOMs generated.  Output: {output_dir}")
-            else:
-                print(f"\n{'=' * 60}")
-                print(f"  Summary: {success_count}/{len(results)} SBOMs generated.")
-                if failed_count:
-                    print(f"  {failed_count} failed — see errors above.")
-                print(f"  Output: {output_dir}")
-                print("=" * 60)
+            print(f"\n{'=' * 60}")
+            print(f"  Summary:")
+            print(f"    - {success_count} SBOMs generated successfully")
+            if skipped_stale:
+                print(f"    - {skipped_stale} skipped (stale, not scanned in 13+ months)")
+            if failed_count:
+                print(f"    - {failed_count} failed (see errors above)")
+            print(f"  Output: {output_dir}")
+            if skipped_stale:
+                print(f"\n  To include skipped applications, rescan them in Veracode.")
+            print("=" * 60)
             input("\nPress Enter to continue...")
 
         elif choice == "4":
@@ -874,7 +1032,8 @@ def interactive_mode(generator: VeracodeSBOMGenerator) -> None:
             print("Fetching workspaces...")
             workspaces = generator.get_workspaces()
 
-            selected_ws = browse_and_select(workspaces, "workspace", name_key="name", id_key="guid")
+            selected_ws = browse_and_select(workspaces, "workspace", name_key="name", id_key="id",
+                                            stale_key="_nonexistent")
             if not selected_ws:
                 print("\nNo workspace selected.")
                 input("\nPress Enter to continue...")
@@ -886,7 +1045,8 @@ def interactive_mode(generator: VeracodeSBOMGenerator) -> None:
             print(f"\nFetching projects for workspace: {workspace_name}")
             projects = generator.get_workspace_projects(ws_guid)
 
-            selected_proj = browse_and_select(projects, "project", name_key="name", id_key="id")
+            selected_proj = browse_and_select(projects, "project", name_key="name", id_key="id",
+                                              stale_key="_nonexistent")
             if not selected_proj:
                 print("\nNo project selected.")
                 input("\nPress Enter to continue...")
@@ -918,7 +1078,8 @@ def interactive_mode(generator: VeracodeSBOMGenerator) -> None:
             print("Fetching workspaces...")
             workspaces = generator.get_workspaces()
 
-            selected = browse_and_select(workspaces, "workspace", name_key="name", id_key="guid")
+            selected = browse_and_select(workspaces, "workspace", name_key="name", id_key="id",
+                                         stale_key="_nonexistent")
             if not selected:
                 print("\nNo workspace selected.")
                 input("\nPress Enter to continue...")
@@ -937,7 +1098,7 @@ def interactive_mode(generator: VeracodeSBOMGenerator) -> None:
 
             timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
             output_dir = f"sbom_output/workspace_{sanitize_filename(workspace_name)}_{timestamp}"
-            success_count = process_sbom_results(results, output_dir)
+            success_count, _ = process_sbom_results(results, output_dir)
             failed_count = len(results) - success_count
 
             if success_count == len(results):
@@ -946,7 +1107,7 @@ def interactive_mode(generator: VeracodeSBOMGenerator) -> None:
                 print(f"\n{'=' * 60}")
                 print(f"  Summary: {success_count}/{len(results)} SBOMs generated.")
                 if failed_count:
-                    print(f"  {failed_count} failed — see errors above.")
+                    print(f"  {failed_count} failed (see errors above).")
                 print(f"  Output: {output_dir}")
                 print("=" * 60)
             input("\nPress Enter to continue...")
@@ -970,6 +1131,20 @@ def command_line_mode(args: argparse.Namespace) -> None:
                 sys.exit(1)
 
             app_name = app.get("profile", {}).get("name", args.app)
+
+            # Check if application is stale
+            if is_app_stale(app):
+                logger.error("")
+                logger.error("=" * 60)
+                logger.error("  ERROR: Application '%s' is stale.", app_name)
+                logger.error("")
+                logger.error("  This application has not been scanned in the last 13 months.")
+                logger.error("  SBOM generation requires a recent scan.")
+                logger.error("")
+                logger.error("  ACTION: Rescan this application in Veracode and try again.")
+                logger.error("=" * 60)
+                sys.exit(1)
+
             logger.info("Generating %s SBOM for: %s", args.format.upper(), app_name)
             sbom = generator.generate_app_sbom(app.get("guid"), args.format, args.linked, not args.no_vulns)
 
@@ -987,12 +1162,60 @@ def command_line_mode(args: argparse.Namespace) -> None:
                 sys.exit(1)
 
             collection_name = collection.get("name", args.collection)
-            logger.info("Generating SBOMs for collection: %s", collection_name)
-            results = generator.generate_collection_sboms(collection.get("guid"), args.format, args.linked, not args.no_vulns)
+
+            # Check for stale assets before proceeding
+            logger.info("Checking collection assets...")
+            assets = generator.get_collection_assets(collection.get("guid"))
+            stale_assets = [a for a in assets if a.get("_is_stale")]
+            eligible_assets = [a for a in assets if not a.get("_is_stale")]
+
+            if stale_assets:
+                logger.warning("")
+                logger.warning("=" * 60)
+                logger.warning("  WARNING: %d of %d applications in this collection are stale",
+                              len(stale_assets), len(assets))
+                logger.warning("  (not scanned in the last 13 months).")
+                logger.warning("")
+                logger.warning("  Stale applications:")
+                for asset in stale_assets[:10]:
+                    logger.warning("    - %s", asset.get("name", "Unknown"))
+                if len(stale_assets) > 10:
+                    logger.warning("    ... and %d more", len(stale_assets) - 10)
+                logger.warning("")
+                logger.warning("  These applications will be SKIPPED during SBOM generation.")
+                logger.warning("  To include them, rescan them in Veracode first.")
+                logger.warning("=" * 60)
+                logger.warning("")
+
+            if not eligible_assets:
+                logger.error("")
+                logger.error("=" * 60)
+                logger.error("  ERROR: All applications in collection '%s' are stale.", collection_name)
+                logger.error("")
+                logger.error("  No applications have been scanned in the last 13 months.")
+                logger.error("  SBOM generation cannot proceed.")
+                logger.error("")
+                logger.error("  ACTION: Rescan the applications in this collection and try again.")
+                logger.error("=" * 60)
+                sys.exit(1)
+
+            logger.info("Generating SBOMs for collection: %s (%d eligible of %d total)",
+                       collection_name, len(eligible_assets), len(assets))
+            results = generator.generate_collection_sboms(
+                collection.get("guid"), args.format, args.linked, not args.no_vulns, skip_stale=True
+            )
 
             col_output_dir = os.path.join(output_dir, f"collection_{sanitize_filename(collection_name)}_{timestamp}")
-            success_count = process_sbom_results(results, col_output_dir)
-            logger.info("\nSummary: %d/%d SBOMs generated", success_count, len(results))
+            success_count, skipped_stale = process_sbom_results(results, col_output_dir)
+            failed_count = len(results) - success_count - skipped_stale
+
+            logger.info("")
+            logger.info("Summary:")
+            logger.info("  - %d SBOMs generated successfully", success_count)
+            if skipped_stale:
+                logger.info("  - %d skipped (stale, not scanned in 13+ months)", skipped_stale)
+            if failed_count:
+                logger.info("  - %d failed", failed_count)
 
         elif args.workspace and args.project:
             logger.info("Fetching workspace: %s", args.workspace)
@@ -1031,7 +1254,7 @@ def command_line_mode(args: argparse.Namespace) -> None:
             results = generator.generate_workspace_sboms(ws_guid, args.format, not args.no_vulns)
 
             ws_output_dir = os.path.join(output_dir, f"workspace_{sanitize_filename(workspace_name)}_{timestamp}")
-            success_count = process_sbom_results(results, ws_output_dir)
+            success_count, _ = process_sbom_results(results, ws_output_dir)
             logger.info("\nSummary: %d/%d SBOMs generated", success_count, len(results))
 
         else:
