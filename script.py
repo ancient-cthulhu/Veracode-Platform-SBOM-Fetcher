@@ -6,8 +6,11 @@ import re
 import sys
 import json
 import time
+import random
 import logging
 import argparse
+import threading
+from email.utils import parsedate_to_datetime
 from datetime import datetime, timedelta, UTC
 from dataclasses import dataclass, field
 from typing import Optional, List, Dict, Set, Tuple
@@ -26,12 +29,29 @@ except ImportError:
 logging.basicConfig(level=logging.INFO, format="%(message)s")
 logger = logging.getLogger(__name__)
 
+
 # Constants
 UNSAFE_FILENAME_CHARS = re.compile(r'[/\\:*?"<>| ]')
 REQUEST_TIMEOUT = 30
 MAX_RETRIES = 3
 RETRY_BACKOFF_FACTOR = 1.0
-RATE_LIMIT_DELAY = 0.2
+
+# Veracode REST API documented limit: 500 calls/minute per IP address.
+# This script only uses REST endpoints, so we throttle below that ceiling.
+VERACODE_REST_LIMIT_PER_MINUTE = 500
+VERACODE_REST_SAFETY_MARGIN = 0.90
+VERACODE_REST_EFFECTIVE_LIMIT_PER_MINUTE = int(
+    VERACODE_REST_LIMIT_PER_MINUTE * VERACODE_REST_SAFETY_MARGIN
+)
+
+# Token bucket settings.
+RATE_LIMIT_CAPACITY = VERACODE_REST_EFFECTIVE_LIMIT_PER_MINUTE
+RATE_LIMIT_REFILL_RATE_PER_SECOND = VERACODE_REST_EFFECTIVE_LIMIT_PER_MINUTE / 60.0
+
+# Retry/backoff bounds.
+MAX_BACKOFF_SECONDS = 60
+DEFAULT_RETRY_AFTER_SECONDS = 60
+
 PAGE_SIZE = 10
 SBOM_ELIGIBILITY_DAYS = 395  # ~13 months
 
@@ -48,6 +68,71 @@ class SBOMResult:
     @property
     def success(self) -> bool:
         return self.sbom is not None and bool(self.sbom)
+
+
+class TokenBucketRateLimiter:
+    """Thread-safe token bucket rate limiter.
+
+    Used to stay below REST API limit:
+    500 requests/minute per IP address.
+
+    The default script configuration uses 450 requests/minute to provide
+    a 10% safety margin.
+    """
+
+    def __init__(self, capacity: int, refill_rate_per_second: float) -> None:
+        self.capacity = float(capacity)
+        self.tokens = float(capacity)
+        self.refill_rate_per_second = float(refill_rate_per_second)
+        self.updated_at = time.monotonic()
+        self.lock = threading.Lock()
+
+    def acquire(self) -> None:
+        """Block until one request token is available."""
+        while True:
+            with self.lock:
+                now = time.monotonic()
+                elapsed = now - self.updated_at
+                self.updated_at = now
+
+                self.tokens = min(
+                    self.capacity,
+                    self.tokens + elapsed * self.refill_rate_per_second
+                )
+
+                if self.tokens >= 1.0:
+                    self.tokens -= 1.0
+                    return
+
+                missing_tokens = 1.0 - self.tokens
+                sleep_for = missing_tokens / self.refill_rate_per_second
+
+            time.sleep(max(sleep_for, 0.01))
+
+
+def parse_retry_after(value: Optional[str]) -> float:
+    """Parse Retry-After header as seconds or HTTP-date.
+
+    Veracode returns Retry-After with 429 responses. Usually this is seconds,
+    but HTTP allows either seconds or an HTTP-date.
+    """
+    if not value:
+        return float(DEFAULT_RETRY_AFTER_SECONDS)
+
+    value = value.strip()
+
+    try:
+        return max(0.0, float(value))
+    except ValueError:
+        pass
+
+    try:
+        retry_dt = parsedate_to_datetime(value)
+        if retry_dt.tzinfo is None:
+            retry_dt = retry_dt.replace(tzinfo=UTC)
+        return max(0.0, (retry_dt - datetime.now(UTC)).total_seconds())
+    except Exception:
+        return float(DEFAULT_RETRY_AFTER_SECONDS)
 
 
 def get_sbom_cutoff_date() -> datetime:
@@ -88,7 +173,7 @@ def get_stale_apps_warning(stale_apps: List[Dict], name_key: str = "name") -> st
         "  in the last 13 months and cannot be used for SBOM generation:",
         "-" * 60,
     ]
-    for app in stale_apps[:10]:  # Limit to first 10
+    for app in stale_apps[:10]:
         if name_key == "profile":
             name = app.get("profile", {}).get("name", "Unknown")
         else:
@@ -121,7 +206,11 @@ class VeracodeSBOMGenerator:
         "workspaces": "/srcclr/v3/workspaces",
     }
 
-    def __init__(self, region: str = "commercial") -> None:
+    def __init__(
+        self,
+        region: str = "commercial",
+        rate_limit_per_minute: int = VERACODE_REST_EFFECTIVE_LIMIT_PER_MINUTE
+    ) -> None:
         self.base_url = self.REGIONS.get(region.lower(), self.REGIONS["commercial"])
         self.session = requests.Session()
         self.session.auth = RequestsAuthPluginVeracodeHMAC()
@@ -130,17 +219,24 @@ class VeracodeSBOMGenerator:
             "Content-Type": "application/json"
         })
 
-        retry_strategy = Retry(
-            total=MAX_RETRIES,
-            backoff_factor=RETRY_BACKOFF_FACTOR,
-            status_forcelist=[500, 502, 503, 504],
-            allowed_methods=["GET"],
-            raise_on_status=False
-        )
-        adapter = HTTPAdapter(max_retries=retry_strategy)
+        # Disable urllib3 retries to avoid double retrying.
+        # _make_request handles:
+        # - Veracode REST throttling
+        # - 429 Retry-After
+        # - transient 5xx retries
+        # - timeout/connection retries
+        adapter = HTTPAdapter(max_retries=Retry(total=0))
         self.session.mount("https://", adapter)
         self.session.mount("http://", adapter)
-        self._last_request_time = 0.0
+
+        if rate_limit_per_minute <= 0:
+            raise ValueError("rate_limit_per_minute must be greater than zero")
+
+        self.rate_limit_per_minute = rate_limit_per_minute
+        self.rate_limiter = TokenBucketRateLimiter(
+            capacity=rate_limit_per_minute,
+            refill_rate_per_second=rate_limit_per_minute / 60.0,
+        )
 
     def __enter__(self) -> "VeracodeSBOMGenerator":
         return self
@@ -154,53 +250,115 @@ class VeracodeSBOMGenerator:
         self.session.close()
 
     def _make_request(self, endpoint: str, params: Optional[Dict] = None) -> Dict:
-        """Make an authenticated API request with rate limiting and retries."""
-        elapsed = time.time() - self._last_request_time
-        if elapsed < RATE_LIMIT_DELAY:
-            time.sleep(RATE_LIMIT_DELAY - elapsed)
+        """Make an authenticated API request with Veracode-aware rate limiting.
 
+        Veracode REST APIs are documented at 500 calls/minute per IP address.
+        This method uses a token bucket set below that limit, honors 429 Retry-After,
+        and applies jittered exponential backoff for transient failures.
+        """
         url = f"{self.base_url}{endpoint}"
         last_exception: Optional[Exception] = None
 
         for attempt in range(MAX_RETRIES + 1):
             try:
+                # Client-side throttle before every attempt, including retries.
+                self.rate_limiter.acquire()
+
                 response = self.session.get(url, params=params, timeout=REQUEST_TIMEOUT)
-                self._last_request_time = time.time()
 
                 if response.status_code == 429:
+                    retry_after = parse_retry_after(response.headers.get("Retry-After"))
+
                     if attempt < MAX_RETRIES:
-                        retry_after = int(response.headers.get("Retry-After", 60))
-                        logger.warning("Rate limited. Waiting %d seconds...", retry_after)
-                        time.sleep(retry_after)
+                        # Small jitter avoids retry storms if multiple jobs are running.
+                        jitter = random.uniform(0.1, 1.0)
+                        wait_time = retry_after + jitter
+
+                        logger.warning(
+                            "Rate limited by Veracode. Waiting %.1f seconds before retrying... (%d/%d)",
+                            wait_time,
+                            attempt + 1,
+                            MAX_RETRIES,
+                        )
+                        time.sleep(wait_time)
                         continue
-                    logger.error("Rate limit exceeded after retries.")
+
+                    logger.error(
+                        "Rate limit exceeded after %d retries. Last Retry-After was %.1f seconds.",
+                        MAX_RETRIES,
+                        retry_after,
+                    )
                     return {}
 
-                response.raise_for_status()
-                return response.json()
+                if response.status_code in {500, 502, 503, 504}:
+                    if attempt < MAX_RETRIES:
+                        base_wait = min(
+                            RETRY_BACKOFF_FACTOR * (2 ** attempt),
+                            MAX_BACKOFF_SECONDS,
+                        )
+                        jitter = random.uniform(0.1, 1.0)
+                        wait_time = base_wait + jitter
 
-            except requests.exceptions.JSONDecodeError:
-                logger.error("Invalid JSON response from: %s", endpoint)
-                return {}
+                        logger.warning(
+                            "Transient server error %d, retrying in %.1fs... (%d/%d)",
+                            response.status_code,
+                            wait_time,
+                            attempt + 1,
+                            MAX_RETRIES,
+                        )
+                        time.sleep(wait_time)
+                        continue
+
+                response.raise_for_status()
+
+                try:
+                    return response.json()
+                except requests.exceptions.JSONDecodeError:
+                    logger.error("Invalid JSON response from: %s", endpoint)
+                    return {}
+
             except requests.exceptions.Timeout as e:
                 last_exception = e
                 if attempt < MAX_RETRIES:
-                    wait_time = RETRY_BACKOFF_FACTOR * (2 ** attempt)
-                    logger.warning("Timeout, retrying in %.1fs... (%d/%d)",
-                                   wait_time, attempt + 1, MAX_RETRIES)
+                    base_wait = min(
+                        RETRY_BACKOFF_FACTOR * (2 ** attempt),
+                        MAX_BACKOFF_SECONDS,
+                    )
+                    jitter = random.uniform(0.1, 1.0)
+                    wait_time = base_wait + jitter
+
+                    logger.warning(
+                        "Timeout, retrying in %.1fs... (%d/%d)",
+                        wait_time,
+                        attempt + 1,
+                        MAX_RETRIES,
+                    )
                     time.sleep(wait_time)
                     continue
+
             except requests.exceptions.ConnectionError as e:
                 last_exception = e
                 if attempt < MAX_RETRIES:
-                    wait_time = RETRY_BACKOFF_FACTOR * (2 ** attempt)
-                    logger.warning("Connection error, retrying in %.1fs... (%d/%d)",
-                                   wait_time, attempt + 1, MAX_RETRIES)
+                    base_wait = min(
+                        RETRY_BACKOFF_FACTOR * (2 ** attempt),
+                        MAX_BACKOFF_SECONDS,
+                    )
+                    jitter = random.uniform(0.1, 1.0)
+                    wait_time = base_wait + jitter
+
+                    logger.warning(
+                        "Connection error, retrying in %.1fs... (%d/%d)",
+                        wait_time,
+                        attempt + 1,
+                        MAX_RETRIES,
+                    )
                     time.sleep(wait_time)
                     continue
+
             except requests.exceptions.HTTPError as e:
                 status = e.response.status_code if e.response is not None else "unknown"
                 detail = ""
+
                 if e.response is not None:
                     try:
                         errors = e.response.json().get("_embedded", {}).get("errors", [])
@@ -208,19 +366,23 @@ class VeracodeSBOMGenerator:
                             detail = errors[0].get("detail") or errors[0].get("title", "")
                     except Exception:
                         pass
+
                 messages = {
                     401: "Authentication failed. Check your API credentials.",
                     403: "Access denied.",
                     404: detail or "Resource not found.",
                 }
+
                 logger.error("Error %s: %s", status, messages.get(status, detail or str(e)))
                 return {}
+
             except requests.exceptions.RequestException as e:
                 logger.error("Request failed: %s", e)
                 return {}
 
         if last_exception:
             logger.error("Request failed after %d retries: %s", MAX_RETRIES, last_exception)
+
         return {}
 
     def _extract_embedded(self, result: Dict, key: str) -> List[Dict]:
@@ -229,8 +391,12 @@ class VeracodeSBOMGenerator:
             return []
         return result.get("_embedded", {}).get(key, [])
 
-    def _get_all_pages(self, endpoint: str, embedded_key: str,
-                       params: Optional[Dict] = None) -> List[Dict]:
+    def _get_all_pages(
+        self,
+        endpoint: str,
+        embedded_key: str,
+        params: Optional[Dict] = None
+    ) -> List[Dict]:
         """Fetch all pages using HAL _links.next or page object pagination."""
         all_items: List[Dict] = []
         current_params = params.copy() if params else {}
@@ -264,8 +430,14 @@ class VeracodeSBOMGenerator:
 
         return all_items
 
-    def _get_sbom(self, target_guid: str, sbom_format: str, target_type: str = "application",
-                  include_linked: bool = False, include_vulnerabilities: bool = True) -> Optional[Dict]:
+    def _get_sbom(
+        self,
+        target_guid: str,
+        sbom_format: str,
+        target_type: str = "application",
+        include_linked: bool = False,
+        include_vulnerabilities: bool = True
+    ) -> Optional[Dict]:
         """Fetch SBOM for a target."""
         endpoint = f"/srcclr/sbom/v1/targets/{target_guid}/{sbom_format}"
         params: Dict[str, str] = {"type": target_type}
@@ -279,23 +451,19 @@ class VeracodeSBOMGenerator:
         result = self._make_request(endpoint, params)
         return result if result else None
 
-    def get_applications(self, name_filter: Optional[str] = None, page_size: int = 100,
-                         include_stale: bool = True) -> List[Dict]:
-        """Get applications, marking stale ones with _is_stale flag.
-        
-        Args:
-            name_filter: Optional name filter
-            page_size: Page size for API requests
-            include_stale: If True, include stale apps marked with _is_stale=True.
-                          If False, only return eligible apps.
-        """
+    def get_applications(
+        self,
+        name_filter: Optional[str] = None,
+        page_size: int = 100,
+        include_stale: bool = True
+    ) -> List[Dict]:
+        """Get applications, marking stale ones with _is_stale flag."""
         params: Dict = {"size": page_size}
         if name_filter:
             params["name"] = name_filter
 
         apps = self._get_all_pages(self.ENDPOINTS["applications"], "applications", params)
 
-        # Mark each app with staleness flag
         for app in apps:
             app["_is_stale"] = is_app_stale(app)
 
@@ -313,11 +481,21 @@ class VeracodeSBOMGenerator:
             None
         )
 
-    def generate_app_sbom(self, app_guid: str, sbom_format: str = "cyclonedx",
-                          include_linked: bool = False,
-                          include_vulnerabilities: bool = True) -> Optional[Dict]:
-        """Generate SBOM for an application profile (upload/policy scan results)."""
-        return self._get_sbom(app_guid, sbom_format, "application", include_linked, include_vulnerabilities)
+    def generate_app_sbom(
+        self,
+        app_guid: str,
+        sbom_format: str = "cyclonedx",
+        include_linked: bool = False,
+        include_vulnerabilities: bool = True
+    ) -> Optional[Dict]:
+        """Generate SBOM for an application profile."""
+        return self._get_sbom(
+            app_guid,
+            sbom_format,
+            "application",
+            include_linked,
+            include_vulnerabilities
+        )
 
     def get_collections(self) -> List[Dict]:
         """Get all collections."""
@@ -326,25 +504,30 @@ class VeracodeSBOMGenerator:
     def get_collection_by_name(self, collection_name: str) -> Optional[Dict]:
         """Find a collection by exact name match (case-insensitive)."""
         name_lower = collection_name.lower()
-        return next((c for c in self.get_collections() if c.get("name", "").lower() == name_lower), None)
+        return next(
+            (c for c in self.get_collections() if c.get("name", "").lower() == name_lower),
+            None
+        )
 
     def get_collection_assets(self, collection_guid: str) -> List[Dict]:
         """Get all assets in a collection, marking stale ones."""
-        assets = self._get_all_pages(f"{self.ENDPOINTS['collections']}/{collection_guid}/assets", "assets")
+        assets = self._get_all_pages(
+            f"{self.ENDPOINTS['collections']}/{collection_guid}/assets",
+            "assets"
+        )
         for asset in assets:
             asset["_is_stale"] = is_app_stale(asset)
         return assets
 
-    def generate_collection_sboms(self, collection_guid: str, sbom_format: str = "cyclonedx",
-                                   include_linked: bool = False,
-                                   include_vulnerabilities: bool = True,
-                                   skip_stale: bool = True) -> List[SBOMResult]:
-        """Generate SBOMs for all applications in a collection.
-        
-        Args:
-            skip_stale: If True, skip stale apps and mark them in results.
-                       If False, attempt generation (will likely fail).
-        """
+    def generate_collection_sboms(
+        self,
+        collection_guid: str,
+        sbom_format: str = "cyclonedx",
+        include_linked: bool = False,
+        include_vulnerabilities: bool = True,
+        skip_stale: bool = True
+    ) -> List[SBOMResult]:
+        """Generate SBOMs for all applications in a collection."""
         assets = self.get_collection_assets(collection_guid)
         total = len(assets)
         stale_assets = [a for a in assets if a.get("_is_stale")]
@@ -357,7 +540,6 @@ class VeracodeSBOMGenerator:
 
         results: List[SBOMResult] = []
 
-        # Process stale assets first (mark as skipped)
         if skip_stale:
             for asset in stale_assets:
                 app_guid = asset.get("guid", "")
@@ -369,13 +551,22 @@ class VeracodeSBOMGenerator:
                     skipped_stale=True
                 ))
 
-        # Process eligible assets
         assets_to_process = eligible_assets if skip_stale else assets
         for i, asset in enumerate(assets_to_process, 1):
             app_guid = asset.get("guid", "")
             app_name = asset.get("name", "Unknown")
-            logger.info("   [%d/%d] Generating SBOM for: %s", i, len(assets_to_process), app_name)
-            sbom = self.generate_app_sbom(app_guid, sbom_format, include_linked, include_vulnerabilities)
+            logger.info(
+                "   [%d/%d] Generating SBOM for: %s",
+                i,
+                len(assets_to_process),
+                app_name
+            )
+            sbom = self.generate_app_sbom(
+                app_guid,
+                sbom_format,
+                include_linked,
+                include_vulnerabilities
+            )
             results.append(SBOMResult(guid=app_guid, name=app_name, sbom=sbom))
 
         return results
@@ -387,14 +578,14 @@ class VeracodeSBOMGenerator:
     def get_workspace_by_name(self, workspace_name: str) -> Optional[Dict]:
         """Find a workspace by exact name match (case-insensitive)."""
         name_lower = workspace_name.lower()
-        return next((ws for ws in self.get_workspaces() if ws.get("name", "").lower() == name_lower), None)
+        return next(
+            (ws for ws in self.get_workspaces() if ws.get("name", "").lower() == name_lower),
+            None
+        )
 
     @staticmethod
     def _workspace_guid(workspace: Dict) -> str:
-        """Return the UUID for a workspace object.
-        
-        The srcclr /v3/workspaces API returns 'id' as the UUID field.
-        """
+        """Return the UUID for a workspace object."""
         return workspace.get("id", "")
 
     @staticmethod
@@ -404,23 +595,43 @@ class VeracodeSBOMGenerator:
 
     def get_workspace_projects(self, workspace_guid: str) -> List[Dict]:
         """Get all projects in a workspace."""
-        return self._get_all_pages(f"{self.ENDPOINTS['workspaces']}/{workspace_guid}/projects", "projects")
+        return self._get_all_pages(
+            f"{self.ENDPOINTS['workspaces']}/{workspace_guid}/projects",
+            "projects"
+        )
 
     def get_project_by_name(self, workspace_guid: str, project_name: str) -> Optional[Dict]:
         """Find a project by exact name match (case-insensitive)."""
         name_lower = project_name.lower()
         return next(
-            (p for p in self.get_workspace_projects(workspace_guid) if p.get("name", "").lower() == name_lower),
+            (
+                p for p in self.get_workspace_projects(workspace_guid)
+                if p.get("name", "").lower() == name_lower
+            ),
             None
         )
 
-    def generate_agent_sbom(self, project_guid: str, sbom_format: str = "cyclonedx",
-                            include_vulnerabilities: bool = True) -> Optional[Dict]:
+    def generate_agent_sbom(
+        self,
+        project_guid: str,
+        sbom_format: str = "cyclonedx",
+        include_vulnerabilities: bool = True
+    ) -> Optional[Dict]:
         """Generate SBOM for an agent-based scan project."""
-        return self._get_sbom(project_guid, sbom_format, "agent", False, include_vulnerabilities)
+        return self._get_sbom(
+            project_guid,
+            sbom_format,
+            "agent",
+            False,
+            include_vulnerabilities
+        )
 
-    def generate_workspace_sboms(self, workspace_guid: str, sbom_format: str = "cyclonedx",
-                                  include_vulnerabilities: bool = True) -> List[SBOMResult]:
+    def generate_workspace_sboms(
+        self,
+        workspace_guid: str,
+        sbom_format: str = "cyclonedx",
+        include_vulnerabilities: bool = True
+    ) -> List[SBOMResult]:
         """Generate SBOMs for all projects in a workspace."""
         projects = self.get_workspace_projects(workspace_guid)
         total = len(projects)
@@ -431,7 +642,11 @@ class VeracodeSBOMGenerator:
             project_guid = self._project_guid(project)
             project_name = project.get("name", "Unknown")
             logger.info("   [%d/%d] Generating SBOM for: %s", i, total, project_name)
-            sbom = self.generate_agent_sbom(project_guid, sbom_format, include_vulnerabilities)
+            sbom = self.generate_agent_sbom(
+                project_guid,
+                sbom_format,
+                include_vulnerabilities
+            )
             results.append(SBOMResult(guid=project_guid, name=project_name, sbom=sbom))
         return results
 
@@ -567,10 +782,15 @@ class BrowserState:
 class ItemBrowser:
     """Interactive browser for selecting items with filtering and pagination."""
 
-    def __init__(self, items: List[Dict], item_type: str,
-                 name_key: str = "name", id_key: str = "guid",
-                 allow_multi: bool = False,
-                 stale_key: str = "_is_stale") -> None:
+    def __init__(
+        self,
+        items: List[Dict],
+        item_type: str,
+        name_key: str = "name",
+        id_key: str = "guid",
+        allow_multi: bool = False,
+        stale_key: str = "_is_stale"
+    ) -> None:
         self.items = items
         self.item_type = item_type
         self.name_key = name_key
@@ -632,11 +852,12 @@ class ItemBrowser:
             print(f" matching '{s.filter_str}'", end="")
         print(f" ({len(s.filtered_items)} total)")
 
-        # Show stale warning if applicable
         if self.stale_count > 0:
             print("-" * 55)
-            print(f"  NOTE: {self.eligible_count} eligible for SBOM | "
-                  f"{self.stale_count} STALE (marked with [STALE])")
+            print(
+                f"  NOTE: {self.eligible_count} eligible for SBOM | "
+                f"{self.stale_count} STALE (marked with [STALE])"
+            )
             print("  Stale apps have not been scanned in 13+ months.")
             print("  To enable SBOM generation, rescan these apps in Veracode.")
 
@@ -655,7 +876,6 @@ class ItemBrowser:
                 suffix = f"  (last scan: {subtitle})" if subtitle else ""
 
                 if is_item_stale:
-                    # Dim/strike-through effect using prefix
                     print(f"  {i:3d}. {self.get_name(item)}{suffix}{stale_marker}")
                 else:
                     print(f"  {i:3d}. {self.get_name(item)}{suffix}{marker}")
@@ -672,8 +892,11 @@ class ItemBrowser:
         if self.allow_multi:
             print("  [#] Add by number (1 or 1,3,5)   [R] Review selected")
             print("  [A] Add all eligible             [D] Done - proceed")
-            print(f"  [C] Clear filter                 [X] Clear selection" if s.filter_str else
-                  "                                   [X] Clear selection")
+            print(
+                f"  [C] Clear filter                 [X] Clear selection"
+                if s.filter_str else
+                "                                   [X] Clear selection"
+            )
         else:
             print("  [#] Select by number    [text] Filter by name")
             if s.filter_str:
@@ -683,7 +906,8 @@ class ItemBrowser:
     def apply_filter(self, text: str) -> None:
         self.state.filter_str = text.lower()
         self.state.filtered_items = [
-            item for item in self.items if self.state.filter_str in self.get_name(item).lower()
+            item for item in self.items
+            if self.state.filter_str in self.get_name(item).lower()
         ]
         self.state.page = 0
         if not self.state.filtered_items:
@@ -700,10 +924,15 @@ class ItemBrowser:
             if 1 <= idx <= len(self.state.filtered_items):
                 item = self.state.filtered_items[idx - 1]
 
-                # Block stale items
                 if self.is_stale(item):
-                    print(f"  BLOCKED: '{self.get_name(item)}' is stale (not scanned in 13+ months).")
-                    print(f"           Rescan this application in Veracode to enable SBOM generation.")
+                    print(
+                        f"  BLOCKED: '{self.get_name(item)}' is stale "
+                        f"(not scanned in 13+ months)."
+                    )
+                    print(
+                        "           Rescan this application in Veracode "
+                        "to enable SBOM generation."
+                    )
                     continue
 
                 item_id = self.get_id(item)
@@ -788,7 +1017,10 @@ class ItemBrowser:
                         print(f"  Removed: {self.get_name(removed)}")
                 if self.state.selected:
                     print(f"  {len(self.state.selected)} item(s) remaining")
-                    review_page = min(review_page, (len(self.state.selected) - 1) // PAGE_SIZE)
+                    review_page = min(
+                        review_page,
+                        (len(self.state.selected) - 1) // PAGE_SIZE
+                    )
             except ValueError:
                 print("  Invalid input.")
 
@@ -808,7 +1040,9 @@ class ItemBrowser:
 
             if choice == "0":
                 if self.allow_multi and self.state.selected:
-                    if input(f"Discard {len(self.state.selected)} selected? [y/N]: ").strip().lower() != 'y':
+                    if input(
+                        f"Discard {len(self.state.selected)} selected? [y/N]: "
+                    ).strip().lower() != 'y':
                         continue
                 return None
 
@@ -839,19 +1073,23 @@ class ItemBrowser:
 
             if any(c.isdigit() for c in choice):
                 try:
-                    nums = [int(x.strip()) for x in choice.replace(" ", ",").split(",") if x.strip().isdigit()]
+                    nums = [
+                        int(x.strip())
+                        for x in choice.replace(" ", ",").split(",")
+                        if x.strip().isdigit()
+                    ]
                     if self.allow_multi:
                         self.add_items(nums)
                     else:
                         for num in nums:
                             if 1 <= num <= len(self.state.filtered_items):
                                 item = self.state.filtered_items[num - 1]
-                                # Block stale items in single-select mode
+
                                 if self.is_stale(item):
                                     print(f"\n  BLOCKED: '{self.get_name(item)}' is stale.")
-                                    print(f"  This application has not been scanned in the last 13 months.")
-                                    print(f"  SBOM generation requires a recent scan.")
-                                    print(f"  ACTION: Rescan this application in Veracode and try again.")
+                                    print("  This application has not been scanned in the last 13 months.")
+                                    print("  SBOM generation requires a recent scan.")
+                                    print("  ACTION: Rescan this application in Veracode and try again.")
                                     input("\n  Press Enter to continue...")
                                     break
                                 return [item]
@@ -864,11 +1102,23 @@ class ItemBrowser:
             self.apply_filter(choice)
 
 
-def browse_and_select(items: List[Dict], item_type: str, name_key: str = "name",
-                      id_key: str = "guid", allow_multi: bool = False,
-                      stale_key: str = "_is_stale") -> Optional[List[Dict]]:
+def browse_and_select(
+    items: List[Dict],
+    item_type: str,
+    name_key: str = "name",
+    id_key: str = "guid",
+    allow_multi: bool = False,
+    stale_key: str = "_is_stale"
+) -> Optional[List[Dict]]:
     """Convenience function for interactive item selection."""
-    return ItemBrowser(items, item_type, name_key, id_key, allow_multi, stale_key).run()
+    return ItemBrowser(
+        items,
+        item_type,
+        name_key,
+        id_key,
+        allow_multi,
+        stale_key
+    ).run()
 
 
 # Main Application Modes
@@ -891,12 +1141,16 @@ def interactive_mode(generator: VeracodeSBOMGenerator) -> None:
             print("Fetching applications...")
             apps = generator.get_applications(include_stale=True)
 
-            # Show warning if there are stale apps
             stale_apps = [a for a in apps if a.get("_is_stale")]
             if stale_apps:
                 print(get_stale_apps_warning(stale_apps, name_key="profile"))
 
-            selected = browse_and_select(apps, "application", name_key="profile", id_key="guid")
+            selected = browse_and_select(
+                apps,
+                "application",
+                name_key="profile",
+                id_key="guid"
+            )
             if not selected:
                 print("\nNo application selected.")
                 input("\nPress Enter to continue...")
@@ -910,12 +1164,18 @@ def interactive_mode(generator: VeracodeSBOMGenerator) -> None:
             include_linked, include_vulns = select_options()
 
             print(f"\nGenerating {sbom_format.upper()} SBOM...")
-            sbom = generator.generate_app_sbom(app.get("guid"), sbom_format, include_linked, include_vulns)
+            sbom = generator.generate_app_sbom(
+                app.get("guid"),
+                sbom_format,
+                include_linked,
+                include_vulns
+            )
 
             if sbom:
                 timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-                filepath = f"sbom_output/{sanitize_filename(app_name)}_sbom_{timestamp}.json"
-                if save_sbom(sbom, f"{sanitize_filename(app_name)}_sbom_{timestamp}.json", "sbom_output"):
+                filename = f"{sanitize_filename(app_name)}_sbom_{timestamp}.json"
+                filepath = f"sbom_output/{filename}"
+                if save_sbom(sbom, filename, "sbom_output"):
                     print_success(f"SBOM saved: {filepath}")
             else:
                 print_error("Failed to generate SBOM. See details above.")
@@ -927,12 +1187,17 @@ def interactive_mode(generator: VeracodeSBOMGenerator) -> None:
             print("Fetching applications...")
             apps = generator.get_applications(include_stale=True)
 
-            # Show warning if there are stale apps
             stale_apps = [a for a in apps if a.get("_is_stale")]
             if stale_apps:
                 print(get_stale_apps_warning(stale_apps, name_key="profile"))
 
-            selected = browse_and_select(apps, "application", name_key="profile", id_key="guid", allow_multi=True)
+            selected = browse_and_select(
+                apps,
+                "application",
+                name_key="profile",
+                id_key="guid",
+                allow_multi=True
+            )
             if not selected:
                 print("\nNo applications selected.")
                 input("\nPress Enter to continue...")
@@ -951,8 +1216,17 @@ def interactive_mode(generator: VeracodeSBOMGenerator) -> None:
             for i, app in enumerate(selected, 1):
                 app_name = app.get("profile", {}).get("name", "Unknown")
                 print(f"\n[{i}/{len(selected)}] {app_name}")
-                sbom = generator.generate_app_sbom(app.get("guid"), sbom_format, include_linked, include_vulns)
-                if sbom and save_sbom(sbom, f"{sanitize_filename(app_name)}_sbom_{timestamp}.json", "sbom_output"):
+                sbom = generator.generate_app_sbom(
+                    app.get("guid"),
+                    sbom_format,
+                    include_linked,
+                    include_vulns
+                )
+                if sbom and save_sbom(
+                    sbom,
+                    f"{sanitize_filename(app_name)}_sbom_{timestamp}.json",
+                    "sbom_output"
+                ):
                     success_count += 1
                 else:
                     failed.append(app_name)
@@ -976,8 +1250,13 @@ def interactive_mode(generator: VeracodeSBOMGenerator) -> None:
             print("Fetching collections...")
             collections = generator.get_collections()
 
-            selected = browse_and_select(collections, "collection", name_key="name", id_key="guid",
-                                         stale_key="_nonexistent")  # Collections don't have stale flag
+            selected = browse_and_select(
+                collections,
+                "collection",
+                name_key="name",
+                id_key="guid",
+                stale_key="_nonexistent"
+            )
             if not selected:
                 print("\nNo collection selected.")
                 input("\nPress Enter to continue...")
@@ -987,7 +1266,6 @@ def interactive_mode(generator: VeracodeSBOMGenerator) -> None:
             collection_name = collection.get("name", "Unknown")
             print(f"\nSelected: {collection_name}")
 
-            # Check for stale assets in collection before proceeding
             print("\nChecking collection assets...")
             assets = generator.get_collection_assets(collection.get("guid"))
             stale_assets = [a for a in assets if a.get("_is_stale")]
@@ -1006,7 +1284,11 @@ def interactive_mode(generator: VeracodeSBOMGenerator) -> None:
             print("\nGenerating SBOMs for collection...")
 
             results = generator.generate_collection_sboms(
-                collection.get("guid"), sbom_format, include_linked, include_vulns, skip_stale=True
+                collection.get("guid"),
+                sbom_format,
+                include_linked,
+                include_vulns,
+                skip_stale=True
             )
             timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
             output_dir = f"sbom_output/collection_{sanitize_filename(collection_name)}_{timestamp}"
@@ -1014,7 +1296,7 @@ def interactive_mode(generator: VeracodeSBOMGenerator) -> None:
             failed_count = len(results) - success_count - skipped_stale
 
             print(f"\n{'=' * 60}")
-            print(f"  Summary:")
+            print("  Summary:")
             print(f"    - {success_count} SBOMs generated successfully")
             if skipped_stale:
                 print(f"    - {skipped_stale} skipped (stale, not scanned in 13+ months)")
@@ -1022,7 +1304,7 @@ def interactive_mode(generator: VeracodeSBOMGenerator) -> None:
                 print(f"    - {failed_count} failed (see errors above)")
             print(f"  Output: {output_dir}")
             if skipped_stale:
-                print(f"\n  To include skipped applications, rescan them in Veracode.")
+                print("\n  To include skipped applications, rescan them in Veracode.")
             print("=" * 60)
             input("\nPress Enter to continue...")
 
@@ -1032,8 +1314,13 @@ def interactive_mode(generator: VeracodeSBOMGenerator) -> None:
             print("Fetching workspaces...")
             workspaces = generator.get_workspaces()
 
-            selected_ws = browse_and_select(workspaces, "workspace", name_key="name", id_key="id",
-                                            stale_key="_nonexistent")
+            selected_ws = browse_and_select(
+                workspaces,
+                "workspace",
+                name_key="name",
+                id_key="id",
+                stale_key="_nonexistent"
+            )
             if not selected_ws:
                 print("\nNo workspace selected.")
                 input("\nPress Enter to continue...")
@@ -1045,8 +1332,13 @@ def interactive_mode(generator: VeracodeSBOMGenerator) -> None:
             print(f"\nFetching projects for workspace: {workspace_name}")
             projects = generator.get_workspace_projects(ws_guid)
 
-            selected_proj = browse_and_select(projects, "project", name_key="name", id_key="id",
-                                              stale_key="_nonexistent")
+            selected_proj = browse_and_select(
+                projects,
+                "project",
+                name_key="name",
+                id_key="id",
+                stale_key="_nonexistent"
+            )
             if not selected_proj:
                 print("\nNo project selected.")
                 input("\nPress Enter to continue...")
@@ -1078,8 +1370,13 @@ def interactive_mode(generator: VeracodeSBOMGenerator) -> None:
             print("Fetching workspaces...")
             workspaces = generator.get_workspaces()
 
-            selected = browse_and_select(workspaces, "workspace", name_key="name", id_key="id",
-                                         stale_key="_nonexistent")
+            selected = browse_and_select(
+                workspaces,
+                "workspace",
+                name_key="name",
+                id_key="id",
+                stale_key="_nonexistent"
+            )
             if not selected:
                 print("\nNo workspace selected.")
                 input("\nPress Enter to continue...")
@@ -1122,7 +1419,10 @@ def command_line_mode(args: argparse.Namespace) -> None:
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     output_dir = args.output or "sbom_output"
 
-    with VeracodeSBOMGenerator(region=args.region) as generator:
+    with VeracodeSBOMGenerator(
+        region=args.region,
+        rate_limit_per_minute=args.rate_limit_per_minute
+    ) as generator:
         if args.app:
             logger.info("Fetching application: %s", args.app)
             app = generator.get_application_by_name(args.app)
@@ -1132,7 +1432,6 @@ def command_line_mode(args: argparse.Namespace) -> None:
 
             app_name = app.get("profile", {}).get("name", args.app)
 
-            # Check if application is stale
             if is_app_stale(app):
                 logger.error("")
                 logger.error("=" * 60)
@@ -1146,10 +1445,19 @@ def command_line_mode(args: argparse.Namespace) -> None:
                 sys.exit(1)
 
             logger.info("Generating %s SBOM for: %s", args.format.upper(), app_name)
-            sbom = generator.generate_app_sbom(app.get("guid"), args.format, args.linked, not args.no_vulns)
+            sbom = generator.generate_app_sbom(
+                app.get("guid"),
+                args.format,
+                args.linked,
+                not args.no_vulns
+            )
 
             if sbom:
-                save_sbom(sbom, f"{sanitize_filename(app_name)}_sbom_{timestamp}.json", output_dir)
+                save_sbom(
+                    sbom,
+                    f"{sanitize_filename(app_name)}_sbom_{timestamp}.json",
+                    output_dir
+                )
             else:
                 logger.error("Failed to generate SBOM.")
                 sys.exit(1)
@@ -1163,7 +1471,6 @@ def command_line_mode(args: argparse.Namespace) -> None:
 
             collection_name = collection.get("name", args.collection)
 
-            # Check for stale assets before proceeding
             logger.info("Checking collection assets...")
             assets = generator.get_collection_assets(collection.get("guid"))
             stale_assets = [a for a in assets if a.get("_is_stale")]
@@ -1172,8 +1479,11 @@ def command_line_mode(args: argparse.Namespace) -> None:
             if stale_assets:
                 logger.warning("")
                 logger.warning("=" * 60)
-                logger.warning("  WARNING: %d of %d applications in this collection are stale",
-                              len(stale_assets), len(assets))
+                logger.warning(
+                    "  WARNING: %d of %d applications in this collection are stale",
+                    len(stale_assets),
+                    len(assets)
+                )
                 logger.warning("  (not scanned in the last 13 months).")
                 logger.warning("")
                 logger.warning("  Stale applications:")
@@ -1199,13 +1509,24 @@ def command_line_mode(args: argparse.Namespace) -> None:
                 logger.error("=" * 60)
                 sys.exit(1)
 
-            logger.info("Generating SBOMs for collection: %s (%d eligible of %d total)",
-                       collection_name, len(eligible_assets), len(assets))
+            logger.info(
+                "Generating SBOMs for collection: %s (%d eligible of %d total)",
+                collection_name,
+                len(eligible_assets),
+                len(assets)
+            )
             results = generator.generate_collection_sboms(
-                collection.get("guid"), args.format, args.linked, not args.no_vulns, skip_stale=True
+                collection.get("guid"),
+                args.format,
+                args.linked,
+                not args.no_vulns,
+                skip_stale=True
             )
 
-            col_output_dir = os.path.join(output_dir, f"collection_{sanitize_filename(collection_name)}_{timestamp}")
+            col_output_dir = os.path.join(
+                output_dir,
+                f"collection_{sanitize_filename(collection_name)}_{timestamp}"
+            )
             success_count, skipped_stale = process_sbom_results(results, col_output_dir)
             failed_count = len(results) - success_count - skipped_stale
 
@@ -1232,11 +1553,23 @@ def command_line_mode(args: argparse.Namespace) -> None:
 
             project_name = project.get("name", args.project)
             proj_guid = VeracodeSBOMGenerator._project_guid(project)
-            logger.info("Generating %s SBOM for project: %s", args.format.upper(), project_name)
-            sbom = generator.generate_agent_sbom(proj_guid, args.format, not args.no_vulns)
+            logger.info(
+                "Generating %s SBOM for project: %s",
+                args.format.upper(),
+                project_name
+            )
+            sbom = generator.generate_agent_sbom(
+                proj_guid,
+                args.format,
+                not args.no_vulns
+            )
 
             if sbom:
-                save_sbom(sbom, f"{sanitize_filename(project_name)}_agent_sbom_{timestamp}.json", output_dir)
+                save_sbom(
+                    sbom,
+                    f"{sanitize_filename(project_name)}_agent_sbom_{timestamp}.json",
+                    output_dir
+                )
             else:
                 logger.error("Failed to generate SBOM.")
                 sys.exit(1)
@@ -1250,10 +1583,20 @@ def command_line_mode(args: argparse.Namespace) -> None:
 
             workspace_name = workspace.get("name", args.workspace)
             ws_guid = VeracodeSBOMGenerator._workspace_guid(workspace)
-            logger.info("Generating SBOMs for all projects in workspace: %s", workspace_name)
-            results = generator.generate_workspace_sboms(ws_guid, args.format, not args.no_vulns)
+            logger.info(
+                "Generating SBOMs for all projects in workspace: %s",
+                workspace_name
+            )
+            results = generator.generate_workspace_sboms(
+                ws_guid,
+                args.format,
+                not args.no_vulns
+            )
 
-            ws_output_dir = os.path.join(output_dir, f"workspace_{sanitize_filename(workspace_name)}_{timestamp}")
+            ws_output_dir = os.path.join(
+                output_dir,
+                f"workspace_{sanitize_filename(workspace_name)}_{timestamp}"
+            )
             success_count, _ = process_sbom_results(results, ws_output_dir)
             logger.info("\nSummary: %d/%d SBOMs generated", success_count, len(results))
 
@@ -1274,6 +1617,12 @@ Examples:
   Collection:           python script.py --collection "MyCollection" --format spdx
   Agent project:        python script.py --workspace "MyWorkspace" --project "MyProject"
   All workspace:        python script.py --workspace "MyWorkspace"
+
+Rate limiting:
+  Veracode REST APIs are documented at 500 requests/minute per IP.
+  This script defaults to 450 requests/minute as a safety margin.
+  Adjust if you share an egress IP with other jobs:
+    python script.py --collection "MyCollection" --rate-limit-per-minute 300
         """
     )
 
@@ -1284,19 +1633,55 @@ Examples:
     target_group.add_argument("--project", "-p", help="SCA project name (requires --workspace)")
 
     format_group = parser.add_argument_group("Format Options")
-    format_group.add_argument("--format", "-f", choices=["cyclonedx", "spdx"], default="cyclonedx",
-                              help="SBOM format (default: cyclonedx)")
+    format_group.add_argument(
+        "--format",
+        "-f",
+        choices=["cyclonedx", "spdx"],
+        default="cyclonedx",
+        help="SBOM format (default: cyclonedx)"
+    )
 
     options_group = parser.add_argument_group("Additional Options")
-    options_group.add_argument("--linked", "-l", action="store_true", help="Include linked agent-based scan results")
-    options_group.add_argument("--no-vulns", action="store_true", help="Exclude vulnerability information")
-    options_group.add_argument("--output", "-o", help="Output directory (default: sbom_output)")
-    options_group.add_argument("--region", "-r", choices=["commercial", "european", "federal"],
-                               default="commercial", help="Veracode region (default: commercial)")
+    options_group.add_argument(
+        "--linked",
+        "-l",
+        action="store_true",
+        help="Include linked agent-based scan results"
+    )
+    options_group.add_argument(
+        "--no-vulns",
+        action="store_true",
+        help="Exclude vulnerability information"
+    )
+    options_group.add_argument(
+        "--output",
+        "-o",
+        help="Output directory (default: sbom_output)"
+    )
+    options_group.add_argument(
+        "--region",
+        "-r",
+        choices=["commercial", "european", "federal"],
+        default="commercial",
+        help="Veracode region (default: commercial)"
+    )
+    options_group.add_argument(
+        "--rate-limit-per-minute",
+        type=int,
+        default=VERACODE_REST_EFFECTIVE_LIMIT_PER_MINUTE,
+        help=(
+            "Client-side REST API rate limit per minute. "
+            f"Default: {VERACODE_REST_EFFECTIVE_LIMIT_PER_MINUTE}. "
+            "Veracode REST documented limit is 500/minute/IP."
+        )
+    )
 
     args = parser.parse_args()
 
-    if not os.environ.get("VERACODE_API_KEY_ID") and not os.path.exists(os.path.expanduser("~/.veracode/credentials")):
+    if (
+        not os.environ.get("VERACODE_API_KEY_ID")
+        and not os.path.exists(os.path.expanduser("~/.veracode/credentials"))
+    ):
         logger.warning("Warning: Veracode API credentials not found.")
         logger.warning("   Set VERACODE_API_KEY_ID and VERACODE_API_KEY_SECRET environment variables")
         logger.warning("   Or create ~/.veracode/credentials file\n")
@@ -1304,7 +1689,10 @@ Examples:
     if any([args.app, args.collection, args.workspace]):
         command_line_mode(args)
     else:
-        with VeracodeSBOMGenerator(region=args.region) as generator:
+        with VeracodeSBOMGenerator(
+            region=args.region,
+            rate_limit_per_minute=args.rate_limit_per_minute
+        ) as generator:
             interactive_mode(generator)
 
 
